@@ -226,6 +226,133 @@ func TestLarkScenarioOutboundGroupAndDirectRequests(t *testing.T) {
 	}
 }
 
+func TestLarkScenarioCredentialInboundAndFixedReply(t *testing.T) {
+	const fixedReply = "Beak Agent 已收到你的飞书消息"
+	connector := NewConnector()
+	webhookConnector, ok := any(connector).(WebhookConnector)
+	if !ok {
+		t.Fatal("connector should implement WebhookConnector")
+	}
+	gateway := newScenarioGateway(Platform)
+	store := newScenarioStore()
+	account := scenarioLarkAccount("account-fixed", "cli_fixed", "secret_fixed", "ou_bot_fixed")
+
+	var sent scenarioLarkSentMessage
+	httpClient := &http.Client{Transport: scenarioRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["app_id"] != "cli_fixed" || body["app_secret"] != "secret_fixed" {
+				t.Fatalf("token body=%+v", body)
+			}
+			return scenarioJSONResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "token-fixed", "expire": 7200})
+		case "/open-apis/im/v1/messages":
+			if got := r.Header.Get("Authorization"); got != "Bearer token-fixed" {
+				t.Fatalf("authorization=%q", got)
+			}
+			var body struct {
+				ReceiveID string `json:"receive_id"`
+				MsgType   string `json:"msg_type"`
+				Content   string `json:"content"`
+				UUID      string `json:"uuid"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			var content map[string]string
+			if err := json.Unmarshal([]byte(body.Content), &content); err != nil {
+				t.Fatal(err)
+			}
+			sent = scenarioLarkSentMessage{
+				receiveIDType: r.URL.Query().Get("receive_id_type"),
+				receiveID:     body.ReceiveID,
+				msgType:       body.MsgType,
+				uuid:          body.UUID,
+				text:          content["text"],
+			}
+			return scenarioJSONResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"message_id": "om-fixed-reply", "chat_id": "oc_fixed"}})
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+		return nil, nil
+	})}
+
+	runtime := sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+		AccountStore:  store,
+		HTTPClient:    httpClient,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	err := connector.Start(ctx, runtime)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Start error=%v", err)
+	}
+
+	result, err := webhookConnector.HandleWebhook(context.Background(), runtime, account, []byte(`{
+		"schema":"2.0",
+		"header":{"event_id":"evt-fixed-1","event_type":"im.message.receive_v1","app_id":"cli_fixed","token":"verify-token"},
+		"event":{
+			"sender":{"sender_id":{"open_id":"ou_user_fixed"},"sender_type":"user"},
+			"message":{"message_id":"om-fixed-1","chat_id":"oc_fixed","chat_type":"group","message_type":"text","content":"{\"text\":\"你好 Beak\"}","create_time":"1770000000100"}
+		}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Ignored || result.SessionUUID == "" || result.MessageUUID == "" {
+		t.Fatalf("result=%+v", result)
+	}
+	if result.Inbound == nil || result.Inbound.ChatType != sdk.ChatTypeGroup || result.Inbound.ChatID != "oc_fixed" || result.Inbound.Text != "你好 Beak" {
+		t.Fatalf("inbound=%+v", result.Inbound)
+	}
+
+	account.State = store.state("account-fixed")
+	sendResult, err := connector.Send(context.Background(), runtime, sdk.OutboundMessage{
+		AccountUUID: "account-fixed",
+		ChatType:    result.Inbound.ChatType,
+		ChatID:      result.Inbound.ChatID,
+		Text:        fixedReply,
+		MessageUUID: "agent-message-fixed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sendResult.MessageID != "om-fixed-reply" || sendResult.AccountUUID != "account-fixed" {
+		t.Fatalf("send result=%+v", sendResult)
+	}
+	if sent.receiveIDType != "chat_id" || sent.receiveID != "oc_fixed" || sent.msgType != "text" || sent.uuid != "agent-message-fixed" || sent.text != fixedReply {
+		t.Fatalf("sent=%+v", sent)
+	}
+
+	gateway.mu.Lock()
+	createdMessages := append([]sdk.CreateMessageRequest(nil), gateway.messages...)
+	chatRequests := append([]sdk.EnsureChatSessionRequest(nil), gateway.chatRequests...)
+	gateway.mu.Unlock()
+	if len(createdMessages) != 1 || createdMessages[0].Content != "你好 Beak" || createdMessages[0].SenderID != "im:lark:group:oc_fixed:user:ou_user_fixed" {
+		t.Fatalf("created messages=%+v", createdMessages)
+	}
+	if len(chatRequests) != 1 || chatRequests[0].AccountUUID != "account-fixed" || chatRequests[0].ChatType != sdk.ChatTypeGroup || chatRequests[0].ChatID != "oc_fixed" {
+		t.Fatalf("chat requests=%+v", chatRequests)
+	}
+	state := store.state("account-fixed")
+	peerSessions, ok := state["peer_sessions"].(map[string]string)
+	if !ok || peerSessions["group:oc_fixed"] != result.SessionUUID {
+		t.Fatalf("peer sessions=%+v", state["peer_sessions"])
+	}
+	inboundSeen, ok := state["inbound_seen"].(map[string]string)
+	if !ok || inboundSeen["account-fixed:message:om-fixed-1"] == "" {
+		t.Fatalf("inbound seen=%+v", state["inbound_seen"])
+	}
+}
+
 func scenarioLarkAccount(uuid, appID, secret, botOpenID string) sdk.ChannelAccount {
 	return sdk.ChannelAccount{
 		UUID:          uuid,
@@ -243,6 +370,14 @@ func scenarioLarkAccount(uuid, appID, secret, botOpenID string) sdk.ChannelAccou
 		},
 		State: map[string]any{},
 	}
+}
+
+type scenarioLarkSentMessage struct {
+	receiveIDType string
+	receiveID     string
+	msgType       string
+	uuid          string
+	text          string
 }
 
 type scenarioGateway struct {
