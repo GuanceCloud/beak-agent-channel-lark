@@ -1,0 +1,517 @@
+package beaklark
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"beak-agent-lark/internal/lark"
+	"beak-agent-lark/sdk"
+	"beak-agent-lark/state"
+)
+
+var ErrCredentialLogin = errors.New("lark connector uses credential login; create channel account from CredentialSchema")
+
+type Connector struct {
+	channel Channel
+}
+
+type WebhookResult struct {
+	Type        string              `json:"type"`
+	Challenge   string              `json:"challenge,omitempty"`
+	Ignored     bool                `json:"ignored,omitempty"`
+	Reason      string              `json:"reason,omitempty"`
+	SessionUUID string              `json:"session_uuid,omitempty"`
+	MessageUUID string              `json:"message_uuid,omitempty"`
+	Inbound     *sdk.InboundMessage `json:"inbound,omitempty"`
+}
+
+type WebhookConnector interface {
+	sdk.Connector
+	HandleWebhook(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, body []byte) (*WebhookResult, error)
+}
+
+func NewConnector() Connector {
+	return Connector{channel: Channel{}}
+}
+
+func (c Connector) Metadata() sdk.ConnectorMetadata {
+	meta := c.channel.Metadata()
+	caps := c.channel.Capabilities()
+	return sdk.ConnectorMetadata{
+		ID:          meta.ID,
+		Platform:    meta.Platform,
+		Label:       meta.Label,
+		Description: meta.Description,
+		Capabilities: sdk.Capabilities{
+			LoginModes:     []string{sdk.LoginModeCredential},
+			Text:           caps.Text,
+			Media:          caps.Media,
+			GroupChat:      caps.GroupChat,
+			DirectChat:     caps.DirectChat,
+			BlockStreaming: caps.BlockStreaming,
+		},
+	}
+}
+
+func (c Connector) CredentialSchema(context.Context) sdk.CredentialSchema {
+	schema := c.channel.SettingsSchema()
+	properties := make(map[string]sdk.CredentialField, len(schema.Properties))
+	for key, raw := range schema.Properties {
+		item, _ := raw.(map[string]any)
+		properties[key] = sdk.CredentialField{
+			Type:        stringValue(item["type"]),
+			Title:       stringValue(item["title"]),
+			Description: stringValue(item["description"]),
+			Secret:      boolValue(item["secret"]),
+		}
+	}
+	return sdk.CredentialSchema{
+		Type:                 schema.Type,
+		LoginModes:           []string{sdk.LoginModeCredential},
+		Properties:           properties,
+		Required:             schema.Required,
+		AdditionalProperties: false,
+	}
+}
+
+func (Connector) StartLogin(context.Context, sdk.LoginStartRequest) (*sdk.LoginChallenge, error) {
+	return nil, ErrCredentialLogin
+}
+
+func (Connector) PollLogin(context.Context, sdk.LoginPollRequest) (*sdk.LoginStatus, error) {
+	return nil, ErrCredentialLogin
+}
+
+func (c Connector) Start(ctx context.Context, runtime sdk.Runtime) error {
+	if runtime.Gateway == nil {
+		return fmt.Errorf("lark connector requires sdk.Runtime.Gateway")
+	}
+	if _, err := runtime.Gateway.EnsureChannel(ctx, sdk.EnsureChannelRequest{
+		WorkspaceUUID: runtime.WorkspaceUUID,
+		Platform:      Platform,
+		Name:          "Lark/Feishu",
+		Config:        map[string]any{"bridge": ID},
+	}); err != nil {
+		return err
+	}
+	store := newConnectorStateStore(runtime.AccountStore)
+	for _, account := range runtimeAccountCandidates(runtime) {
+		store.seed(account)
+		accountUUID := accountKey(account)
+		if accountUUID == "" {
+			return fmt.Errorf("lark account_uuid or app_id is required")
+		}
+		sessionUUID, err := runtime.Gateway.EnsureChannelLinkSession(ctx, sdk.EnsureChannelLinkSessionRequest{
+			WorkspaceUUID:       runtime.WorkspaceUUID,
+			Platform:            Platform,
+			AccountUUID:         accountUUID,
+			AgentParticipantID:  runtime.Gateway.AgentParticipantID(),
+			BridgeParticipantID: runtime.Gateway.BridgeParticipantID(Platform),
+		})
+		if err != nil {
+			return err
+		}
+		state, err := store.LoadAccount(accountUUID)
+		if err != nil {
+			return err
+		}
+		if state.ChannelLinkSession != sessionUUID {
+			state.ChannelLinkSession = sessionUUID
+			if err := store.SaveAccount(state); err != nil {
+				return err
+			}
+		}
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (c Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.OutboundMessage) (*sdk.SendResult, error) {
+	account, err := selectRuntimeAccount(runtime, req.AccountUUID)
+	if err != nil {
+		return nil, err
+	}
+	client := clientFromAccount(runtime, account)
+	target := strings.TrimSpace(req.ChatID)
+	if target == "" {
+		return nil, fmt.Errorf("lark outbound chat_id is required")
+	}
+	resp, err := client.SendText(ctx, lark.SendTextRequest{
+		ReceiveID:     target,
+		ReceiveIDType: receiveIDType(req),
+		Text:          req.Text,
+		UUID:          req.MessageUUID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &sdk.SendResult{
+		Platform:    Platform,
+		AccountUUID: accountKey(account),
+		MessageID:   resp.Data.MessageID,
+		Raw: map[string]any{
+			"chat_id": resp.Data.ChatID,
+		},
+	}, nil
+}
+
+func (Connector) Stop(context.Context, sdk.ChannelAccount) error {
+	return nil
+}
+
+func (c Connector) HandleWebhook(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, body []byte) (*WebhookResult, error) {
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err == nil && strings.TrimSpace(stringValue(raw["encrypt"])) != "" {
+		return nil, fmt.Errorf("encrypted lark webhook payloads are not supported in SDK v1; decrypt in Beak host before calling HandleWebhook")
+	}
+	hook, err := lark.ParseWebhook(body)
+	if err != nil {
+		return nil, err
+	}
+	if hook.IsURLVerification() {
+		if !hook.VerifyToken(stringValue(account.Credential["verification_token"])) {
+			return nil, fmt.Errorf("lark webhook verification token mismatch")
+		}
+		return &WebhookResult{Type: "url_verification", Challenge: hook.Challenge}, nil
+	}
+	if hook.EventType() != lark.EventTypeMessageReceive {
+		return &WebhookResult{Type: hook.EventType(), Ignored: true, Reason: "unsupported_event_type"}, nil
+	}
+	return c.processMessageEvent(ctx, runtime, account, hook)
+}
+
+func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, hook *lark.Webhook) (*WebhookResult, error) {
+	if runtime.Gateway == nil {
+		return nil, fmt.Errorf("lark webhook handling requires sdk.Runtime.Gateway")
+	}
+	if !hook.VerifyToken(stringValue(account.Credential["verification_token"])) {
+		return nil, fmt.Errorf("lark webhook verification token mismatch")
+	}
+	accountUUID := accountKey(account)
+	if accountUUID == "" {
+		return nil, fmt.Errorf("lark account_uuid or app_id is required")
+	}
+	botOpenID := firstString(account.Credential["bot_open_id"], account.State["bot_open_id"])
+	senderID := strings.TrimSpace(hook.Event.Sender.SenderID.OpenID)
+	if botOpenID != "" && senderID == botOpenID {
+		return &WebhookResult{Type: hook.EventType(), Ignored: true, Reason: "self_echo"}, nil
+	}
+	text := hook.Event.Message.Text()
+	chat := hook.Event.Message.ChatIdentity(senderID)
+	if chat.ChatType == "" || chat.ChatID == "" || chat.SenderID == "" || text == "" {
+		return &WebhookResult{Type: hook.EventType(), Ignored: true, Reason: "incomplete_or_non_text_message"}, nil
+	}
+
+	store := newConnectorStateStore(runtime.AccountStore)
+	store.seed(account)
+	state, err := store.LoadAccount(accountUUID)
+	if err != nil {
+		return nil, err
+	}
+	key := hook.DedupeKey(accountUUID)
+	if _, ok := state.InboundSeen[key]; ok {
+		return &WebhookResult{Type: hook.EventType(), Ignored: true, Reason: "duplicate", SessionUUID: state.PeerSessions[chat.StateKey()]}, nil
+	}
+
+	sessionUUID, err := runtime.Gateway.EnsureChatSession(ctx, sdk.EnsureChatSessionRequest{
+		WorkspaceUUID:       runtime.WorkspaceUUID,
+		Platform:            Platform,
+		AccountUUID:         accountUUID,
+		ChatType:            chat.ChatType,
+		ChatID:              chat.ChatID,
+		SenderID:            chat.SenderID,
+		AgentParticipantID:  runtime.Gateway.AgentParticipantID(),
+		BridgeParticipantID: runtime.Gateway.BridgeParticipantID(Platform),
+		Metadata: map[string]any{
+			"source":       Platform,
+			"account_uuid": accountUUID,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	inbound := BuildInboundMessage(runtime.WorkspaceUUID, runtime.Channel.UUID, accountUUID, hook, text)
+	messageUUID, err := runtime.Gateway.CreateMessage(ctx, sdk.CreateMessageRequest{
+		WorkspaceUUID: runtime.WorkspaceUUID,
+		SessionUUID:   sessionUUID,
+		SenderID:      sdk.IMPersonParticipantID(Platform, chat.ChatType, chat.ChatID, chat.SenderID),
+		Content:       text,
+		Metadata: map[string]any{
+			"source":            Platform,
+			"platform":          Platform,
+			"account_uuid":      accountUUID,
+			"lark_account_id":   accountUUID,
+			"lark_app_id":       stringValue(account.Credential["app_id"]),
+			"lark_chat_type":    chat.ChatType,
+			"lark_chat_id":      chat.ChatID,
+			"lark_sender_id":    chat.SenderID,
+			"lark_message_id":   hook.Event.Message.MessageID,
+			"lark_event_id":     hook.EventID(),
+			"lark_message_type": hook.Event.Message.MessageType,
+			"inbound_message":   inbound,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	state.PeerSessions[chat.StateKey()] = sessionUUID
+	state.InboundSeen[key] = time.Now().UTC().Format(time.RFC3339Nano)
+	if err := store.SaveAccount(state); err != nil {
+		return nil, err
+	}
+	return &WebhookResult{Type: hook.EventType(), SessionUUID: sessionUUID, MessageUUID: messageUUID, Inbound: &inbound}, nil
+}
+
+func BuildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *lark.Webhook, text string) sdk.InboundMessage {
+	senderID := strings.TrimSpace(hook.Event.Sender.SenderID.OpenID)
+	chat := hook.Event.Message.ChatIdentity(senderID)
+	return sdk.InboundMessage{
+		WorkspaceUUID: workspaceUUID,
+		Platform:      Platform,
+		AccountUUID:   accountUUID,
+		ChannelUUID:   channelUUID,
+		ChatType:      chat.ChatType,
+		ChatID:        chat.ChatID,
+		SenderID:      chat.SenderID,
+		MessageID:     hook.Event.Message.MessageID,
+		Text:          text,
+		DedupeKey:     hook.DedupeKey(accountUUID),
+		Raw: map[string]any{
+			"event_id":     hook.EventID(),
+			"event_type":   hook.EventType(),
+			"app_id":       hook.Header.AppID,
+			"chat_id":      hook.Event.Message.ChatID,
+			"chat_type":    hook.Event.Message.ChatType,
+			"message_id":   hook.Event.Message.MessageID,
+			"message_type": hook.Event.Message.MessageType,
+			"sender_id":    hook.Event.Sender.SenderID,
+			"create_time":  hook.Event.Message.CreateTime,
+			"mentions":     hook.Event.Message.Mentions,
+		},
+	}
+}
+
+func runtimeAccountCandidates(runtime sdk.Runtime) []sdk.ChannelAccount {
+	seen := make(map[string]bool)
+	var out []sdk.ChannelAccount
+	add := func(account sdk.ChannelAccount) {
+		key := accountKey(account)
+		if key == "" || seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, account)
+	}
+	add(runtime.Account)
+	for _, account := range runtime.Accounts {
+		add(account)
+	}
+	return out
+}
+
+func selectRuntimeAccount(runtime sdk.Runtime, accountUUID string) (sdk.ChannelAccount, error) {
+	accountUUID = strings.TrimSpace(accountUUID)
+	candidates := runtimeAccountCandidates(runtime)
+	if accountUUID != "" {
+		for _, account := range candidates {
+			if accountMatches(account, accountUUID) {
+				return account, nil
+			}
+		}
+		return sdk.ChannelAccount{}, fmt.Errorf("lark account %s not found in runtime", accountUUID)
+	}
+	if len(candidates) == 1 {
+		return candidates[0], nil
+	}
+	if len(candidates) == 0 {
+		return sdk.ChannelAccount{}, fmt.Errorf("lark outbound account is required")
+	}
+	return sdk.ChannelAccount{}, fmt.Errorf("lark outbound account is ambiguous; account_uuid is required")
+}
+
+func accountMatches(account sdk.ChannelAccount, accountID string) bool {
+	return strings.TrimSpace(account.UUID) == accountID ||
+		strings.TrimSpace(stringValue(account.Credential["account_id"])) == accountID ||
+		strings.TrimSpace(stringValue(account.Credential["app_id"])) == accountID
+}
+
+func accountKey(account sdk.ChannelAccount) string {
+	return firstString(account.UUID, account.Credential["account_id"], account.Credential["app_id"])
+}
+
+func clientFromAccount(runtime sdk.Runtime, account sdk.ChannelAccount) *lark.Client {
+	baseURL := baseURLFromCredential(account.Credential)
+	client := lark.NewClient(baseURL, stringValue(account.Credential["app_id"]), stringValue(account.Credential["app_secret"]))
+	client.HTTPClient = runtime.HTTPClient
+	return client
+}
+
+func baseURLFromCredential(credential map[string]any) string {
+	if baseURL := strings.TrimSpace(stringValue(credential["base_url"])); baseURL != "" {
+		return baseURL
+	}
+	if strings.EqualFold(strings.TrimSpace(stringValue(credential["brand"])), "lark") {
+		return lark.DefaultLarkBaseURL
+	}
+	return lark.DefaultBaseURL
+}
+
+func receiveIDType(req sdk.OutboundMessage) string {
+	if value := strings.TrimSpace(stringValue(req.Raw["receive_id_type"])); value != "" {
+		return value
+	}
+	if req.ChatType == sdk.ChatTypeGroup {
+		return "chat_id"
+	}
+	return lark.ReceiveIDTypeForTarget(req.ChatID)
+}
+
+type connectorStateStore struct {
+	mu           sync.Mutex
+	accounts     map[string]*state.AccountState
+	sdkAccounts  map[string]sdk.ChannelAccount
+	accountStore sdk.AccountStore
+}
+
+func newConnectorStateStore(accountStore sdk.AccountStore) *connectorStateStore {
+	return &connectorStateStore{
+		accounts:     make(map[string]*state.AccountState),
+		sdkAccounts:  make(map[string]sdk.ChannelAccount),
+		accountStore: accountStore,
+	}
+}
+
+func (s *connectorStateStore) seed(account sdk.ChannelAccount) {
+	accountID := accountKey(account)
+	if accountID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := sdkAccountToState(account)
+	s.accounts[accountID] = &state
+	s.sdkAccounts[accountID] = account
+}
+
+func (s *connectorStateStore) LoadAccount(accountID string) (*state.AccountState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if account, ok := s.accounts[accountID]; ok {
+		return account, nil
+	}
+	account := &state.AccountState{AccountID: accountID}
+	account.EnsureMaps()
+	s.accounts[accountID] = account
+	return account, nil
+}
+
+func (s *connectorStateStore) SaveAccount(account *state.AccountState) error {
+	if err := state.TouchAccount(account); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.accounts[account.AccountID] = account
+	existing := s.sdkAccounts[account.AccountID]
+	sdkAccount := accountStateToSDK(*account, existing)
+	s.sdkAccounts[account.AccountID] = sdkAccount
+	accountStore := s.accountStore
+	s.mu.Unlock()
+	if accountStore != nil && sdkAccount.UUID != "" {
+		return accountStore.SaveChannelAccountState(context.Background(), sdkAccount.UUID, sdkAccount.State)
+	}
+	return nil
+}
+
+func sdkAccountToState(account sdk.ChannelAccount) state.AccountState {
+	out := state.AccountState{
+		AccountID:          accountKey(account),
+		AppID:              stringValue(account.Credential["app_id"]),
+		BaseURL:            baseURLFromCredential(account.Credential),
+		Brand:              stringValue(account.Credential["brand"]),
+		BotOpenID:          firstString(account.Credential["bot_open_id"], account.State["bot_open_id"]),
+		ChannelLinkSession: stringValue(account.State["channel_link_session"]),
+		PeerSessions:       stringMap(account.State["peer_sessions"]),
+		InboundSeen:        stringMap(account.State["inbound_seen"]),
+		SentBeakMessages:   stringMap(account.State["sent_beak_messages"]),
+		StreamCursors:      stringMap(account.State["stream_cursors"]),
+	}
+	out.EnsureMaps()
+	return out
+}
+
+func accountStateToSDK(account state.AccountState, existing sdk.ChannelAccount) sdk.ChannelAccount {
+	if existing.UUID == "" {
+		existing.UUID = account.AccountID
+	}
+	existing.Platform = Platform
+	if existing.Credential == nil {
+		existing.Credential = map[string]any{}
+	}
+	existing.State = map[string]any{
+		"channel_link_session": account.ChannelLinkSession,
+		"peer_sessions":        account.PeerSessions,
+		"inbound_seen":         account.InboundSeen,
+		"sent_beak_messages":   account.SentBeakMessages,
+		"stream_cursors":       account.StreamCursors,
+		"bot_open_id":          account.BotOpenID,
+		"updated_at":           account.UpdatedAt,
+	}
+	return existing
+}
+
+func stringMap(value any) map[string]string {
+	out := make(map[string]string)
+	switch typed := value.(type) {
+	case map[string]string:
+		for key, item := range typed {
+			out[key] = item
+		}
+	case map[string]any:
+		for key, item := range typed {
+			if stringItem, ok := item.(string); ok {
+				out[key] = stringItem
+			}
+		}
+	case json.RawMessage:
+		_ = json.Unmarshal(typed, &out)
+	}
+	return out
+}
+
+func stringValue(value any) string {
+	if value == nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return typed
+	default:
+		return fmt.Sprint(typed)
+	}
+}
+
+func boolValue(value any) bool {
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	default:
+		return false
+	}
+}
+
+func firstString(values ...any) string {
+	for _, value := range values {
+		if stringValue := strings.TrimSpace(stringValue(value)); stringValue != "" {
+			return stringValue
+		}
+	}
+	return ""
+}
+
+var _ sdk.Connector = Connector{}
+var _ WebhookConnector = Connector{}
