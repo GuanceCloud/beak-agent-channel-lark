@@ -31,7 +31,25 @@ type SendTextRequest struct {
 	UUID          string
 }
 
-type SendTextResponse struct {
+type SendMessageRequest struct {
+	ReceiveID     string
+	ReceiveIDType string
+	MsgType       string
+	Content       string
+	UUID          string
+}
+
+type ReplyMessageRequest struct {
+	MessageID     string
+	MsgType       string
+	Content       string
+	UUID          string
+	ReplyInThread *bool
+}
+
+type SendTextResponse = SendMessageResponse
+
+type SendMessageResponse struct {
 	Code int    `json:"code"`
 	Msg  string `json:"msg"`
 	Data struct {
@@ -194,6 +212,9 @@ func ReceiveIDTypeForTarget(target string) string {
 	}
 	if strings.HasPrefix(target, "on_") {
 		return "union_id"
+	}
+	if strings.HasPrefix(target, "ouser_") || strings.HasPrefix(target, "u_") {
+		return "user_id"
 	}
 	return "chat_id"
 }

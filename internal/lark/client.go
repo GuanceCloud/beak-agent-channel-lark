@@ -15,12 +15,13 @@ import (
 const defaultRequestTimeout = 15 * time.Second
 
 type Client struct {
-	BaseURL        string
-	AppID          string
-	AppSecret      string
-	TenantToken    string
-	RequestTimeout time.Duration
-	HTTPClient     *http.Client
+	BaseURL              string
+	AppID                string
+	AppSecret            string
+	TenantToken          string
+	TenantTokenExpiresAt time.Time
+	RequestTimeout       time.Duration
+	HTTPClient           *http.Client
 }
 
 func NewClient(baseURL, appID, appSecret string) *Client {
@@ -37,26 +38,41 @@ func NewClient(baseURL, appID, appSecret string) *Client {
 }
 
 func (c *Client) TenantAccessToken(ctx context.Context) (string, error) {
+	token, _, err := c.TenantAccessTokenWithExpiry(ctx, time.Now().UTC())
+	return token, err
+}
+
+func (c *Client) TenantAccessTokenWithExpiry(ctx context.Context, now time.Time) (string, time.Time, error) {
+	if strings.TrimSpace(c.TenantToken) != "" && c.TenantTokenExpiresAt.After(now.Add(5*time.Minute)) {
+		return c.TenantToken, c.TenantTokenExpiresAt, nil
+	}
 	if strings.TrimSpace(c.AppID) == "" {
-		return "", fmt.Errorf("app_id is required")
+		return "", time.Time{}, fmt.Errorf("app_id is required")
 	}
 	if strings.TrimSpace(c.AppSecret) == "" {
-		return "", fmt.Errorf("app_secret is required")
+		return "", time.Time{}, fmt.Errorf("app_secret is required")
 	}
 	var resp TokenResponse
 	if err := c.doJSON(ctx, http.MethodPost, "/auth/v3/tenant_access_token/internal", nil, map[string]string{
 		"app_id":     c.AppID,
 		"app_secret": c.AppSecret,
 	}, &resp); err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 	if resp.Code != 0 {
-		return "", fmt.Errorf("tenant access token failed: code=%d msg=%s", resp.Code, resp.Msg)
+		return "", time.Time{}, fmt.Errorf("tenant access token failed: code=%d msg=%s", resp.Code, resp.Msg)
 	}
 	if strings.TrimSpace(resp.TenantAccessToken) == "" {
-		return "", fmt.Errorf("tenant access token failed: missing token")
+		return "", time.Time{}, fmt.Errorf("tenant access token failed: missing token")
 	}
-	return resp.TenantAccessToken, nil
+	expiresIn := resp.Expire
+	if expiresIn <= 0 {
+		expiresIn = 7200
+	}
+	expiresAt := now.Add(time.Duration(expiresIn) * time.Second)
+	c.TenantToken = resp.TenantAccessToken
+	c.TenantTokenExpiresAt = expiresAt
+	return resp.TenantAccessToken, expiresAt, nil
 }
 
 func (c *Client) SendText(ctx context.Context, req SendTextRequest) (*SendTextResponse, error) {
@@ -66,31 +82,47 @@ func (c *Client) SendText(ctx context.Context, req SendTextRequest) (*SendTextRe
 	if strings.TrimSpace(req.Text) == "" {
 		return nil, fmt.Errorf("text is required")
 	}
+	content, err := json.Marshal(map[string]string{"text": req.Text})
+	if err != nil {
+		return nil, err
+	}
+	return c.SendMessage(ctx, SendMessageRequest{
+		ReceiveID:     req.ReceiveID,
+		ReceiveIDType: req.ReceiveIDType,
+		MsgType:       "text",
+		Content:       string(content),
+		UUID:          req.UUID,
+	})
+}
+
+func (c *Client) SendMessage(ctx context.Context, req SendMessageRequest) (*SendMessageResponse, error) {
+	if strings.TrimSpace(req.ReceiveID) == "" {
+		return nil, fmt.Errorf("receive_id is required")
+	}
+	msgType := strings.TrimSpace(req.MsgType)
+	if msgType == "" {
+		msgType = "text"
+	}
+	if strings.TrimSpace(req.Content) == "" {
+		return nil, fmt.Errorf("content is required")
+	}
 	receiveIDType := strings.TrimSpace(req.ReceiveIDType)
 	if receiveIDType == "" {
 		receiveIDType = ReceiveIDTypeForTarget(req.ReceiveID)
 	}
-	token := strings.TrimSpace(c.TenantToken)
-	if token == "" {
-		var err error
-		token, err = c.TenantAccessToken(ctx)
-		if err != nil {
-			return nil, err
-		}
-	}
-	content, err := json.Marshal(map[string]string{"text": req.Text})
+	token, err := c.tokenForRequest(ctx)
 	if err != nil {
 		return nil, err
 	}
 	body := map[string]any{
 		"receive_id": req.ReceiveID,
-		"msg_type":   "text",
-		"content":    string(content),
+		"msg_type":   msgType,
+		"content":    req.Content,
 	}
 	if req.UUID != "" {
 		body["uuid"] = req.UUID
 	}
-	var resp SendTextResponse
+	var resp SendMessageResponse
 	if err := c.doJSON(ctx, http.MethodPost, "/im/v1/messages", map[string]string{"receive_id_type": receiveIDType}, body, &resp, withBearer(token)); err != nil {
 		return nil, err
 	}
@@ -98,6 +130,49 @@ func (c *Client) SendText(ctx context.Context, req SendTextRequest) (*SendTextRe
 		return nil, fmt.Errorf("send text failed: code=%d msg=%s", resp.Code, resp.Msg)
 	}
 	return &resp, nil
+}
+
+func (c *Client) ReplyMessage(ctx context.Context, req ReplyMessageRequest) (*SendMessageResponse, error) {
+	if strings.TrimSpace(req.MessageID) == "" {
+		return nil, fmt.Errorf("message_id is required")
+	}
+	msgType := strings.TrimSpace(req.MsgType)
+	if msgType == "" {
+		msgType = "text"
+	}
+	if strings.TrimSpace(req.Content) == "" {
+		return nil, fmt.Errorf("content is required")
+	}
+	token, err := c.tokenForRequest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	body := map[string]any{
+		"msg_type": msgType,
+		"content":  req.Content,
+	}
+	if req.UUID != "" {
+		body["uuid"] = req.UUID
+	}
+	if req.ReplyInThread != nil {
+		body["reply_in_thread"] = *req.ReplyInThread
+	}
+	var resp SendMessageResponse
+	if err := c.doJSON(ctx, http.MethodPost, "/im/v1/messages/"+url.PathEscape(req.MessageID)+"/reply", nil, body, &resp, withBearer(token)); err != nil {
+		return nil, err
+	}
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("reply message failed: code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	return &resp, nil
+}
+
+func (c *Client) tokenForRequest(ctx context.Context) (string, error) {
+	token := strings.TrimSpace(c.TenantToken)
+	if token != "" && (c.TenantTokenExpiresAt.IsZero() || c.TenantTokenExpiresAt.After(time.Now().UTC().Add(5*time.Minute))) {
+		return token, nil
+	}
+	return c.TenantAccessToken(ctx)
 }
 
 type requestOption func(*http.Request)

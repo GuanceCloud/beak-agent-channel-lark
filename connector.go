@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +35,11 @@ type WebhookResult struct {
 type WebhookConnector interface {
 	sdk.Connector
 	HandleWebhook(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, body []byte) (*WebhookResult, error)
+}
+
+type WebhookRequestConnector interface {
+	WebhookConnector
+	HandleWebhookRequest(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, req *http.Request) (*WebhookResult, error)
 }
 
 func NewConnector() Connector {
@@ -136,26 +143,69 @@ func (c Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.Outbou
 	if err != nil {
 		return nil, err
 	}
+	accountUUID := accountKey(account)
+	store := newConnectorStateStore(runtime.AccountStore)
+	store.seed(account)
+	accountState, err := store.LoadAccount(accountUUID)
+	if err != nil {
+		return nil, err
+	}
 	client := clientFromAccount(runtime, account)
+	now := time.Now().UTC()
+	if accountState.TenantAccessToken != "" && accountState.TokenExpiresAt.After(now.Add(5*time.Minute)) {
+		client.TenantToken = accountState.TenantAccessToken
+		client.TenantTokenExpiresAt = accountState.TokenExpiresAt
+	}
+	if client.TenantToken == "" || !client.TenantTokenExpiresAt.After(now.Add(5*time.Minute)) {
+		token, expiresAt, err := client.TenantAccessTokenWithExpiry(ctx, now)
+		if err != nil {
+			return nil, err
+		}
+		accountState.TenantAccessToken = token
+		accountState.TokenExpiresAt = expiresAt
+		if len(account.State) > 0 {
+			if err := store.SaveAccount(accountState); err != nil {
+				return nil, err
+			}
+		}
+	}
 	target := strings.TrimSpace(req.ChatID)
 	if target == "" {
 		return nil, fmt.Errorf("lark outbound chat_id is required")
 	}
-	resp, err := client.SendText(ctx, lark.SendTextRequest{
-		ReceiveID:     target,
-		ReceiveIDType: receiveIDType(req),
-		Text:          req.Text,
-		UUID:          req.MessageUUID,
-	})
+	msgType := outboundMsgType(req)
+	content, err := outboundContent(req, msgType)
+	if err != nil {
+		return nil, err
+	}
+	var resp *lark.SendMessageResponse
+	if replyTo := firstString(req.Raw["reply_to_message_id"], req.Raw["parent_message_id"]); replyTo != "" {
+		resp, err = client.ReplyMessage(ctx, lark.ReplyMessageRequest{
+			MessageID:     replyTo,
+			MsgType:       msgType,
+			Content:       content,
+			UUID:          req.MessageUUID,
+			ReplyInThread: optionalBool(req.Raw["reply_in_thread"]),
+		})
+	} else {
+		resp, err = client.SendMessage(ctx, lark.SendMessageRequest{
+			ReceiveID:     target,
+			ReceiveIDType: receiveIDType(req),
+			MsgType:       msgType,
+			Content:       content,
+			UUID:          req.MessageUUID,
+		})
+	}
 	if err != nil {
 		return nil, err
 	}
 	return &sdk.SendResult{
 		Platform:    Platform,
-		AccountUUID: accountKey(account),
+		AccountUUID: accountUUID,
 		MessageID:   resp.Data.MessageID,
 		Raw: map[string]any{
-			"chat_id": resp.Data.ChatID,
+			"chat_id":  resp.Data.ChatID,
+			"msg_type": msgType,
 		},
 	}, nil
 }
@@ -165,11 +215,11 @@ func (Connector) Stop(context.Context, sdk.ChannelAccount) error {
 }
 
 func (c Connector) HandleWebhook(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, body []byte) (*WebhookResult, error) {
-	var raw map[string]any
-	if err := json.Unmarshal(body, &raw); err == nil && strings.TrimSpace(stringValue(raw["encrypt"])) != "" {
-		return nil, fmt.Errorf("encrypted lark webhook payloads are not supported in SDK v1; decrypt in Beak host before calling HandleWebhook")
+	decoded, err := lark.DecodeWebhookBody(body, stringValue(account.Credential["encrypt_key"]))
+	if err != nil {
+		return nil, err
 	}
-	hook, err := lark.ParseWebhook(body)
+	hook, err := lark.ParseWebhook(decoded)
 	if err != nil {
 		return nil, err
 	}
@@ -183,6 +233,29 @@ func (c Connector) HandleWebhook(ctx context.Context, runtime sdk.Runtime, accou
 		return &WebhookResult{Type: hook.EventType(), Ignored: true, Reason: "unsupported_event_type"}, nil
 	}
 	return c.processMessageEvent(ctx, runtime, account, hook)
+}
+
+func (c Connector) HandleWebhookRequest(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, req *http.Request) (*WebhookResult, error) {
+	if req == nil || req.Body == nil {
+		return nil, fmt.Errorf("lark webhook request body is required")
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, err
+	}
+	signature := firstString(req.Header.Get("X-Lark-Signature"), req.Header.Get("X-Lark-Request-Signature"))
+	if signature != "" {
+		encryptKey := stringValue(account.Credential["encrypt_key"])
+		if encryptKey == "" {
+			return nil, fmt.Errorf("lark webhook signature verification requires encrypt_key")
+		}
+		timestamp := firstString(req.Header.Get("X-Lark-Request-Timestamp"), req.Header.Get("X-Lark-Timestamp"))
+		nonce := firstString(req.Header.Get("X-Lark-Request-Nonce"), req.Header.Get("X-Lark-Nonce"))
+		if !lark.VerifyWebhookSignature(timestamp, nonce, encryptKey, body, signature) {
+			return nil, fmt.Errorf("lark webhook signature mismatch")
+		}
+	}
+	return c.HandleWebhook(ctx, runtime, account, body)
 }
 
 func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, hook *lark.Webhook) (*WebhookResult, error) {
@@ -251,6 +324,9 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 			"lark_chat_id":      chat.ChatID,
 			"lark_sender_id":    chat.SenderID,
 			"lark_message_id":   hook.Event.Message.MessageID,
+			"lark_root_id":      hook.Event.Message.RootID,
+			"lark_parent_id":    hook.Event.Message.ParentID,
+			"lark_thread_id":    hook.Event.Message.ThreadID,
 			"lark_event_id":     hook.EventID(),
 			"lark_message_type": hook.Event.Message.MessageType,
 			"inbound_message":   inbound,
@@ -288,6 +364,9 @@ func BuildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *l
 			"chat_id":      hook.Event.Message.ChatID,
 			"chat_type":    hook.Event.Message.ChatType,
 			"message_id":   hook.Event.Message.MessageID,
+			"root_id":      hook.Event.Message.RootID,
+			"parent_id":    hook.Event.Message.ParentID,
+			"thread_id":    hook.Event.Message.ThreadID,
 			"message_type": hook.Event.Message.MessageType,
 			"sender_id":    hook.Event.Sender.SenderID,
 			"create_time":  hook.Event.Message.CreateTime,
@@ -371,6 +450,46 @@ func receiveIDType(req sdk.OutboundMessage) string {
 	return lark.ReceiveIDTypeForTarget(req.ChatID)
 }
 
+func outboundMsgType(req sdk.OutboundMessage) string {
+	if value := strings.TrimSpace(stringValue(req.Raw["msg_type"])); value != "" {
+		return value
+	}
+	return "text"
+}
+
+func outboundContent(req sdk.OutboundMessage, msgType string) (string, error) {
+	if raw := req.Raw["content"]; raw != nil {
+		switch typed := raw.(type) {
+		case string:
+			if strings.TrimSpace(typed) != "" {
+				return typed, nil
+			}
+		default:
+			data, err := json.Marshal(typed)
+			if err != nil {
+				return "", fmt.Errorf("encode lark outbound content: %w", err)
+			}
+			return string(data), nil
+		}
+	}
+	if msgType != "text" {
+		return "", fmt.Errorf("lark outbound content is required for msg_type=%s", msgType)
+	}
+	data, err := json.Marshal(map[string]string{"text": req.Text})
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func optionalBool(value any) *bool {
+	if value == nil {
+		return nil
+	}
+	out := boolValue(value)
+	return &out
+}
+
 type connectorStateStore struct {
 	mu           sync.Mutex
 	accounts     map[string]*state.AccountState
@@ -433,6 +552,8 @@ func sdkAccountToState(account sdk.ChannelAccount) state.AccountState {
 		AppID:              stringValue(account.Credential["app_id"]),
 		BaseURL:            baseURLFromCredential(account.Credential),
 		Brand:              stringValue(account.Credential["brand"]),
+		TenantAccessToken:  stringValue(account.State["tenant_access_token"]),
+		TokenExpiresAt:     timeValue(account.State["tenant_access_token_expires_at"]),
 		BotOpenID:          firstString(account.Credential["bot_open_id"], account.State["bot_open_id"]),
 		ChannelLinkSession: stringValue(account.State["channel_link_session"]),
 		PeerSessions:       stringMap(account.State["peer_sessions"]),
@@ -453,15 +574,36 @@ func accountStateToSDK(account state.AccountState, existing sdk.ChannelAccount) 
 		existing.Credential = map[string]any{}
 	}
 	existing.State = map[string]any{
-		"channel_link_session": account.ChannelLinkSession,
-		"peer_sessions":        account.PeerSessions,
-		"inbound_seen":         account.InboundSeen,
-		"sent_beak_messages":   account.SentBeakMessages,
-		"stream_cursors":       account.StreamCursors,
-		"bot_open_id":          account.BotOpenID,
-		"updated_at":           account.UpdatedAt,
+		"channel_link_session":           account.ChannelLinkSession,
+		"peer_sessions":                  account.PeerSessions,
+		"inbound_seen":                   account.InboundSeen,
+		"sent_beak_messages":             account.SentBeakMessages,
+		"stream_cursors":                 account.StreamCursors,
+		"tenant_access_token":            account.TenantAccessToken,
+		"tenant_access_token_expires_at": account.TokenExpiresAt,
+		"bot_open_id":                    account.BotOpenID,
+		"updated_at":                     account.UpdatedAt,
 	}
 	return existing
+}
+
+func timeValue(value any) time.Time {
+	switch typed := value.(type) {
+	case time.Time:
+		return typed
+	case string:
+		if typed == "" {
+			return time.Time{}
+		}
+		parsed, _ := time.Parse(time.RFC3339Nano, typed)
+		return parsed
+	case json.RawMessage:
+		var text string
+		if err := json.Unmarshal(typed, &text); err == nil {
+			return timeValue(text)
+		}
+	}
+	return time.Time{}
 }
 
 func stringMap(value any) map[string]string {
@@ -499,6 +641,8 @@ func boolValue(value any) bool {
 	switch typed := value.(type) {
 	case bool:
 		return typed
+	case string:
+		return strings.EqualFold(strings.TrimSpace(typed), "true")
 	default:
 		return false
 	}
@@ -515,3 +659,4 @@ func firstString(values ...any) string {
 
 var _ sdk.Connector = Connector{}
 var _ WebhookConnector = Connector{}
+var _ WebhookRequestConnector = Connector{}
