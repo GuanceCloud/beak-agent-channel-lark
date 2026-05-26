@@ -1,9 +1,15 @@
 package beaklark
 
 import (
+	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -78,6 +84,43 @@ func TestLarkConnectorWebhookChallenge(t *testing.T) {
 		t.Fatal(err)
 	}
 	if result.Challenge != "challenge-1" || result.Type != "url_verification" {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestLarkConnectorEncryptedWebhookChallenge(t *testing.T) {
+	connector := NewConnector()
+	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	account.Credential["encrypt_key"] = "encrypt-key"
+	plain := `{"type":"url_verification","challenge":"challenge-1","token":"verify-token"}`
+	body := []byte(`{"encrypt":"` + encryptWebhookForTest(t, plain, "encrypt-key") + `"}`)
+	result, err := connector.HandleWebhook(context.Background(), sdk.Runtime{}, account, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Challenge != "challenge-1" || result.Type != "url_verification" {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestLarkConnectorWebhookRequestVerifiesSignature(t *testing.T) {
+	connector := NewConnector()
+	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	account.Credential["encrypt_key"] = "encrypt-key"
+	body := []byte(`{"type":"url_verification","challenge":"challenge-1","token":"verify-token"}`)
+	req, err := http.NewRequest(http.MethodPost, "https://beak.test/webhook", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Lark-Request-Timestamp", "1770000000")
+	req.Header.Set("X-Lark-Request-Nonce", "nonce-1")
+	signature := sha256.Sum256([]byte("1770000000" + "nonce-1" + "encrypt-key" + string(body)))
+	req.Header.Set("X-Lark-Signature", fmt.Sprintf("%x", signature[:]))
+	result, err := connector.HandleWebhookRequest(context.Background(), sdk.Runtime{}, account, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Challenge != "challenge-1" {
 		t.Fatalf("result=%+v", result)
 	}
 }
@@ -211,6 +254,55 @@ func TestLarkConnectorSendUsesRequestedAccount(t *testing.T) {
 	}
 }
 
+func TestLarkConnectorSendReplyAndRawContent(t *testing.T) {
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "token-1", "expire": 7200})
+		case "/open-apis/im/v1/messages/om_parent/reply":
+			var body struct {
+				MsgType       string `json:"msg_type"`
+				Content       string `json:"content"`
+				UUID          string `json:"uuid"`
+				ReplyInThread bool   `json:"reply_in_thread"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body.MsgType != "post" || body.Content != `{"zh_cn":{"title":"hi"}}` || !body.ReplyInThread {
+				t.Fatalf("body=%+v", body)
+			}
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"message_id": "om_reply", "chat_id": "oc_group"}})
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+		}
+		return nil, nil
+	})}
+
+	result, err := NewConnector().Send(context.Background(), sdk.Runtime{
+		HTTPClient: httpClient,
+		Account:    sdkAccount("account-1", "cli_1", "secret_1", "https://open.feishu.test"),
+	}, sdk.OutboundMessage{
+		AccountUUID: "account-1",
+		ChatType:    sdk.ChatTypeGroup,
+		ChatID:      "oc_group",
+		Text:        "ignored",
+		MessageUUID: "uuid-1",
+		Raw: map[string]any{
+			"reply_to_message_id": "om_parent",
+			"reply_in_thread":     true,
+			"msg_type":            "post",
+			"content":             map[string]any{"zh_cn": map[string]any{"title": "hi"}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.MessageID != "om_reply" || result.Raw["msg_type"] != "post" {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
 func sdkAccount(uuid, appID, appSecret, baseURL string) sdk.ChannelAccount {
 	credential := map[string]any{
 		"account_id":         uuid,
@@ -319,4 +411,20 @@ func testJSONResponse(body any) (*http.Response, error) {
 		Header:     make(http.Header),
 		Body:       io.NopCloser(strings.NewReader(builder.String())),
 	}, nil
+}
+
+func encryptWebhookForTest(t *testing.T, plain string, key string) string {
+	t.Helper()
+	sum := sha256.Sum256([]byte(key))
+	block, err := aes.NewCipher(sum[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	padding := aes.BlockSize - len(plain)%aes.BlockSize
+	padded := append([]byte(plain), bytes.Repeat([]byte{byte(padding)}, padding)...)
+	iv := []byte("1234567890abcdef")
+	out := make([]byte, len(iv)+len(padded))
+	copy(out, iv)
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(out[len(iv):], padded)
+	return base64.StdEncoding.EncodeToString(out)
 }

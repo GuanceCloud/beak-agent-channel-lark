@@ -1,12 +1,19 @@
 package lark
 
 import (
+	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestClientTenantTokenAndSendText(t *testing.T) {
@@ -95,6 +102,93 @@ func TestClientTenantTokenAndSendText(t *testing.T) {
 	}
 }
 
+func TestClientTenantTokenWithExpiryCachesToken(t *testing.T) {
+	var tokenCalls int
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/open-apis/auth/v3/tenant_access_token/internal" {
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+		}
+		tokenCalls++
+		return jsonResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "tenant-token", "expire": 7200})
+	})}
+	client := NewClient("https://open.feishu.test", "cli_1", "secret_1")
+	client.HTTPClient = httpClient
+	now := time.Now().UTC()
+	token, expiresAt, err := client.TenantAccessTokenWithExpiry(context.Background(), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "tenant-token" || !expiresAt.After(now) {
+		t.Fatalf("token=%q expiresAt=%s", token, expiresAt)
+	}
+	token, _, err = client.TenantAccessTokenWithExpiry(context.Background(), now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "tenant-token" || tokenCalls != 1 {
+		t.Fatalf("token=%q tokenCalls=%d", token, tokenCalls)
+	}
+}
+
+func TestClientSendGenericAndReplyMessage(t *testing.T) {
+	var sawSend bool
+	var sawReply bool
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if got := r.Header.Get("Authorization"); got != "Bearer cached-token" {
+			t.Fatalf("auth=%q", got)
+		}
+		switch r.URL.Path {
+		case "/open-apis/im/v1/messages":
+			sawSend = true
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["msg_type"] != "post" || body["content"] != `{"zh_cn":{"title":"hi"}}` {
+				t.Fatalf("send body=%+v", body)
+			}
+			return jsonResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"message_id": "om_post", "chat_id": "oc_chat"}})
+		case "/open-apis/im/v1/messages/om_parent/reply":
+			sawReply = true
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["msg_type"] != "text" || body["uuid"] != "uuid-1" {
+				t.Fatalf("reply body=%+v", body)
+			}
+			return jsonResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"message_id": "om_reply", "chat_id": "oc_chat"}})
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+		}
+		return nil, nil
+	})}
+	client := NewClient("https://open.feishu.test", "cli_1", "secret_1")
+	client.HTTPClient = httpClient
+	client.TenantToken = "cached-token"
+	_, err := client.SendMessage(context.Background(), SendMessageRequest{
+		ReceiveID:     "oc_chat",
+		ReceiveIDType: "chat_id",
+		MsgType:       "post",
+		Content:       `{"zh_cn":{"title":"hi"}}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.ReplyMessage(context.Background(), ReplyMessageRequest{
+		MessageID: "om_parent",
+		MsgType:   "text",
+		Content:   `{"text":"reply"}`,
+		UUID:      "uuid-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawSend || !sawReply {
+		t.Fatalf("sawSend=%v sawReply=%v", sawSend, sawReply)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -149,4 +243,51 @@ func TestParseURLVerification(t *testing.T) {
 	if !hook.IsURLVerification() || hook.Challenge != "challenge-1" || !hook.VerifyToken("verify-token") {
 		t.Fatalf("hook=%+v", hook)
 	}
+}
+
+func TestDecryptAndDecodeWebhookBody(t *testing.T) {
+	encrypted := encryptForTest(t, `{"type":"url_verification","challenge":"challenge-1","token":"verify-token"}`, "test key")
+	decoded, err := DecodeWebhookBody([]byte(`{"encrypt":"`+encrypted+`"}`), "test key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hook, err := ParseWebhook(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hook.Challenge != "challenge-1" {
+		t.Fatalf("hook=%+v", hook)
+	}
+}
+
+func TestVerifyWebhookSignature(t *testing.T) {
+	body := []byte(`{"encrypt":"abc"}`)
+	sum := sha256.Sum256([]byte("timestamp" + "nonce" + "key" + string(body)))
+	if VerifyWebhookSignature("timestamp", "nonce", "key", body, base64.StdEncoding.EncodeToString(sum[:])) {
+		t.Fatal("base64 signature should not verify")
+	}
+}
+
+func TestVerifyWebhookSignatureHex(t *testing.T) {
+	body := []byte(`{"encrypt":"abc"}`)
+	sum := sha256.Sum256([]byte("timestamp" + "nonce" + "key" + string(body)))
+	if !VerifyWebhookSignature("timestamp", "nonce", "key", body, fmt.Sprintf("%x", sum[:])) {
+		t.Fatal("hex signature should verify")
+	}
+}
+
+func encryptForTest(t *testing.T, plain string, key string) string {
+	t.Helper()
+	sum := sha256.Sum256([]byte(key))
+	block, err := aes.NewCipher(sum[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	padding := aes.BlockSize - len(plain)%aes.BlockSize
+	padded := append([]byte(plain), bytes.Repeat([]byte{byte(padding)}, padding)...)
+	iv := []byte("1234567890abcdef")
+	out := make([]byte, len(iv)+len(padded))
+	copy(out, iv)
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(out[len(iv):], padded)
+	return base64.StdEncoding.EncodeToString(out)
 }

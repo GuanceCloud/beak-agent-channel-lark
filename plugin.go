@@ -98,7 +98,7 @@ func (Channel) SettingsSchema() SettingsSchema {
 			"encrypt_key": map[string]any{
 				"type":        "string",
 				"title":       "Encrypt Key",
-				"description": "Reserved for encrypted event subscriptions; v1 expects plaintext events.",
+				"description": "Optional event subscription encrypt key. Used for encrypted webhook payload decryption and signature verification.",
 				"secret":      true,
 			},
 			"brand": map[string]any{

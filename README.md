@@ -4,7 +4,7 @@
 
 Go SDK package for connecting Beak Channel Gateway to Lark/Feishu bot accounts.
 
-This repository is importable library code. It is not a CLI, does not read user-authored runtime files, does not own persistence, and does not require users to edit server files. The Beak host owns UI, credential persistence, account state persistence, webhook routing, session creation, message writes, agent stream subscription, and runtime packaging. This SDK owns the Lark/Feishu connector logic: credential schema, event challenge handling, text webhook normalization, message dedupe, and text sending through Lark/Feishu Open APIs.
+This repository is importable library code. It is not a CLI, does not read user-authored runtime files, does not own persistence, and does not require users to edit server files. The Beak host owns UI, credential persistence, account state persistence, webhook routing, session creation, message writes, agent stream subscription, and runtime packaging. This SDK owns the Lark/Feishu connector logic: credential schema, event challenge handling, webhook signature/decryption helpers, text webhook normalization, message dedupe, token handling, and outbound delivery through Lark/Feishu Open APIs.
 
 ## Scope
 
@@ -12,13 +12,16 @@ This repository is importable library code. It is not a CLI, does not read user-
 - Credential-based Lark/Feishu bot account setup.
 - Host-backed credential and state persistence.
 - Text-only inbound `im.message.receive_v1` webhook events to Beak sessions.
-- Text-only Beak agent output back to Lark/Feishu through `im/v1/messages`.
+- Text Beak agent output back to Lark/Feishu through `im/v1/messages`.
+- Raw outbound `msg_type`/`content` delivery for host-mapped Lark message types.
+- Optional reply delivery through `im/v1/messages/{message_id}/reply`.
+- Encrypted webhook body decryption and request signature verification when `encrypt_key` is configured.
 - Direct chat and group chat normalization.
 - One connected bot account plus one group chat maps to one Beak session; one connected bot account plus one direct chat maps to one Beak session.
 - If multiple bot accounts are in the same group, each account creates or reuses its own Beak session for that group.
 - One channel-link session is created per bot account connection, without creating a task.
 
-Out of v1 scope: media, voice, typing status, interactive cards, encrypted event payload decryption, WebSocket event client ownership, and Beak host code changes.
+Out of v1 scope: first-class media upload/download helpers, voice, typing status, first-class interactive card builders, WebSocket event client ownership, and Beak host code changes.
 
 ## Package Layout
 
@@ -50,7 +53,16 @@ type WebhookConnector interface {
 }
 ```
 
-Beak host should type assert this interface when routing the Lark/Feishu event callback endpoint.
+For raw `*http.Request` handling with signature verification, the connector also implements:
+
+```go
+type WebhookRequestConnector interface {
+	WebhookConnector
+	HandleWebhookRequest(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, req *http.Request) (*beaklark.WebhookResult, error)
+}
+```
+
+Beak host should type assert one of these interfaces when routing the Lark/Feishu event callback endpoint.
 
 ## Credential Schema
 
@@ -59,7 +71,7 @@ Beak host should type assert this interface when routing the Lark/Feishu event c
 - `app_id`: required, Lark/Feishu self-built application app id.
 - `app_secret`: required, secret.
 - `verification_token`: optional event subscription token.
-- `encrypt_key`: reserved; v1 expects plaintext events or Beak host-side decryption before calling SDK.
+- `encrypt_key`: optional event subscription encrypt key. The SDK uses it for encrypted webhook payload decryption and request signature verification.
 - `brand`: optional, `feishu` or `lark`; defaults to `feishu`.
 - `base_url`: optional Open API base URL override.
 - `bot_open_id`: optional bot open id used to drop self echo messages.
@@ -104,14 +116,15 @@ if result.Challenge != "" {
 `HandleWebhook` supports:
 
 - URL verification challenge.
-- Plaintext `im.message.receive_v1` text events.
+- Plaintext and encrypted `im.message.receive_v1` text events.
 - Verification token checks when `verification_token` exists.
+- Signature verification through `HandleWebhookRequest` when Lark/Feishu signature headers are present.
 - Self-echo filtering when `bot_open_id` exists.
 - Dedupe by message id or event id.
 - Session creation/reuse through `sdk.Gateway.EnsureChatSession`.
 - Beak message creation through `sdk.Gateway.CreateMessage`.
 
-Encrypted event payloads are intentionally not decrypted in v1. If the application enables encrypted events, Beak host must decrypt the event before calling `HandleWebhook`, or keep event encryption disabled for this connector account.
+If Beak host already terminates and verifies webhook requests itself, it can still call `HandleWebhook` with the raw body. If it wants the SDK to verify request headers, call `HandleWebhookRequest`.
 
 ## Sending Text
 
@@ -127,7 +140,7 @@ _, err := connector.Send(ctx, runtime, sdk.OutboundMessage{
 })
 ```
 
-The SDK obtains a tenant access token with:
+The SDK obtains and caches a tenant access token in host-owned account state with:
 
 ```text
 POST /open-apis/auth/v3/tenant_access_token/internal
@@ -140,6 +153,8 @@ POST /open-apis/im/v1/messages?receive_id_type=<chat_id|open_id|union_id>
 ```
 
 For group chats, `receive_id_type=chat_id`. For direct chats, the SDK infers the receive id type from `ChatID`, usually `chat_id` for `oc_...` or `open_id` for `ou_...`.
+
+For non-text payloads mapped by Beak host, set `Raw["msg_type"]` and `Raw["content"]`. For replies, set `Raw["reply_to_message_id"]`; optionally set `Raw["reply_in_thread"]`.
 
 ## Session Rules
 
@@ -182,6 +197,18 @@ Same group, different bot accounts:
 source_id=lark:account_a:group:oc_group
 source_id=lark:account_b:group:oc_group
 ```
+
+## State Rules
+
+Beak host stores account state. The SDK only writes through `sdk.AccountStore.SaveChannelAccountState`:
+
+- `channel_link_session`: connection session for this bot account.
+- `peer_sessions`: chat identity to Beak session uuid cache.
+- `inbound_seen`: inbound dedupe keys.
+- `sent_beak_messages`: reserved outbound message dedupe state.
+- `stream_cursors`: reserved Beak stream cursors.
+- `tenant_access_token` / `tenant_access_token_expires_at`: tenant token cache for send APIs.
+- `bot_open_id`: bot identity used for self-echo filtering.
 
 ## Verification
 
