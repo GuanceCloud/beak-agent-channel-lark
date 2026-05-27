@@ -1,8 +1,8 @@
 package basic
 
 import (
-	beaklark "beak-agent-lark"
-	"beak-agent-lark/sdk"
+	beaklark "github.com/GuanceCloud/beak-agent-channel-lark"
+	"github.com/GuanceCloud/beak-agent-channel-lark/sdk"
 )
 
 func LarkConnector() sdk.Connector {

@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"beak-agent-lark/internal/lark"
-	"beak-agent-lark/sdk"
-	"beak-agent-lark/state"
+	"github.com/GuanceCloud/beak-agent-channel-lark/internal/lark"
+	"github.com/GuanceCloud/beak-agent-channel-lark/sdk"
+	"github.com/GuanceCloud/beak-agent-channel-lark/state"
 )
 
 var ErrCredentialLogin = errors.New("lark connector uses credential login; create channel account from CredentialSchema")

@@ -35,8 +35,8 @@ Out of v1 scope: first-class media upload/download helpers, voice, typing status
 
 ```go
 import (
-	beaklark "beak-agent-lark"
-	"beak-agent-lark/sdk"
+	beaklark "github.com/GuanceCloud/beak-agent-channel-lark"
+	"github.com/GuanceCloud/beak-agent-channel-lark/sdk"
 )
 
 func LarkConnector() sdk.Connector {
