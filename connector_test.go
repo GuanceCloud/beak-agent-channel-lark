@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"beak-agent-lark/sdk"
+	"github.com/GuanceCloud/beak-agent-channel-lark/sdk"
 )
 
 func TestLarkConnectorMetadataAndSchema(t *testing.T) {
