@@ -130,6 +130,7 @@ if result.Challenge != "" {
 - 配置了 `verification_token` 时进行 token 校验。
 - 通过 `HandleWebhookRequest` 校验飞书/Lark 请求签名。
 - 配置了 `bot_open_id` 时过滤 self echo。
+- 标准化提取 `mentions`，并用 `bot_open_id` 判断 `mentioned_me`。
 - 按 message id 或 event id 去重。
 - 通过 `sdk.Gateway.EnsureChatSession` 创建或复用 session。
 - 通过 `sdk.Gateway.CreateMessage` 写入 Beak message。

@@ -120,6 +120,7 @@ if result.Challenge != "" {
 - Verification token checks when `verification_token` exists.
 - Signature verification through `HandleWebhookRequest` when Lark/Feishu signature headers are present.
 - Self-echo filtering when `bot_open_id` exists.
+- Standard `mentions` extraction and `mentioned_me` detection with `bot_open_id`.
 - Dedupe by message id or event id.
 - Session creation/reuse through `sdk.Gateway.EnsureChatSession`.
 - Beak message creation through `sdk.Gateway.CreateMessage`.

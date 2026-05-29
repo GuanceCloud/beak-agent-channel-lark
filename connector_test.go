@@ -135,7 +135,7 @@ func TestLarkConnectorWebhookCreatesMessageAndDedupes(t *testing.T) {
 		"header":{"event_id":"evt_1","event_type":"im.message.receive_v1","app_id":"cli_1","token":"verify-token"},
 		"event":{
 			"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
-			"message":{"message_id":"om_1","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"hello group\"}","create_time":"1770000000000"}
+			"message":{"message_id":"om_1","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"hello group\"}","create_time":"1770000000000","mentions":[{"key":"@_user_1","id":{"open_id":"ou_bot"},"name":"Beak Bot"}]}
 		}
 	}`)
 	runtime := sdk.Runtime{
@@ -154,6 +154,9 @@ func TestLarkConnectorWebhookCreatesMessageAndDedupes(t *testing.T) {
 	}
 	if result.Inbound == nil || result.Inbound.ChatType != sdk.ChatTypeGroup || result.Inbound.ChatID != "oc_group" || result.Inbound.AccountUUID != "account-1" {
 		t.Fatalf("inbound=%+v", result.Inbound)
+	}
+	if !result.Inbound.MentionedMe || len(result.Inbound.Mentions) != 1 || result.Inbound.Mentions[0].ID != "ou_bot" || result.Inbound.Mentions[0].IDType != "open_id" {
+		t.Fatalf("inbound mentions=%+v mentioned_me=%v", result.Inbound.Mentions, result.Inbound.MentionedMe)
 	}
 	gateway.mu.Lock()
 	if len(gateway.chatSessions) != 1 {
