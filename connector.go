@@ -308,7 +308,7 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 	if err != nil {
 		return nil, err
 	}
-	inbound := BuildInboundMessage(runtime.WorkspaceUUID, runtime.Channel.UUID, accountUUID, hook, text)
+	inbound := buildInboundMessage(runtime.WorkspaceUUID, runtime.Channel.UUID, accountUUID, hook, text, botOpenID)
 	messageUUID, err := runtime.Gateway.CreateMessage(ctx, sdk.CreateMessageRequest{
 		WorkspaceUUID: runtime.WorkspaceUUID,
 		SessionUUID:   sessionUUID,
@@ -344,8 +344,13 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 }
 
 func BuildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *lark.Webhook, text string) sdk.InboundMessage {
+	return buildInboundMessage(workspaceUUID, channelUUID, accountUUID, hook, text, "")
+}
+
+func buildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *lark.Webhook, text, botOpenID string) sdk.InboundMessage {
 	senderID := strings.TrimSpace(hook.Event.Sender.SenderID.OpenID)
 	chat := hook.Event.Message.ChatIdentity(senderID)
+	mentions := larkMentionIdentities(hook.Event.Message.Mentions)
 	return sdk.InboundMessage{
 		WorkspaceUUID: workspaceUUID,
 		Platform:      Platform,
@@ -357,6 +362,8 @@ func BuildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *l
 		MessageID:     hook.Event.Message.MessageID,
 		Text:          text,
 		DedupeKey:     hook.DedupeKey(accountUUID),
+		Mentions:      mentions,
+		MentionedMe:   larkMentionsBot(mentions, botOpenID),
 		Raw: map[string]any{
 			"event_id":     hook.EventID(),
 			"event_type":   hook.EventType(),
@@ -373,6 +380,56 @@ func BuildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *l
 			"mentions":     hook.Event.Message.Mentions,
 		},
 	}
+}
+
+func larkMentionIdentities(mentions []lark.Mention) []sdk.MentionIdentity {
+	out := make([]sdk.MentionIdentity, 0, len(mentions)*3)
+	for _, mention := range mentions {
+		displayName := strings.TrimSpace(mention.Name)
+		if id := strings.TrimSpace(mention.ID.OpenID); id != "" {
+			out = append(out, sdk.MentionIdentity{ID: id, IDType: "open_id", DisplayName: displayName})
+		}
+		if id := strings.TrimSpace(mention.ID.UserID); id != "" {
+			out = append(out, sdk.MentionIdentity{ID: id, IDType: "user_id", DisplayName: displayName})
+		}
+		if id := strings.TrimSpace(mention.ID.UnionID); id != "" {
+			out = append(out, sdk.MentionIdentity{ID: id, IDType: "union_id", DisplayName: displayName})
+		}
+	}
+	return uniqueMentionIdentities(out)
+}
+
+func larkMentionsBot(mentions []sdk.MentionIdentity, botOpenID string) bool {
+	botOpenID = strings.TrimSpace(botOpenID)
+	if botOpenID == "" {
+		return false
+	}
+	for _, mention := range mentions {
+		if strings.TrimSpace(mention.ID) == botOpenID && (mention.IDType == "" || mention.IDType == "open_id") {
+			return true
+		}
+	}
+	return false
+}
+
+func uniqueMentionIdentities(mentions []sdk.MentionIdentity) []sdk.MentionIdentity {
+	seen := make(map[string]struct{}, len(mentions))
+	out := make([]sdk.MentionIdentity, 0, len(mentions))
+	for _, mention := range mentions {
+		mention.ID = strings.TrimSpace(mention.ID)
+		mention.IDType = strings.TrimSpace(mention.IDType)
+		mention.DisplayName = strings.TrimSpace(mention.DisplayName)
+		if mention.ID == "" {
+			continue
+		}
+		key := mention.IDType + "\x00" + mention.ID
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, mention)
+	}
+	return out
 }
 
 func runtimeAccountCandidates(runtime sdk.Runtime) []sdk.ChannelAccount {
