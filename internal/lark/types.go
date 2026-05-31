@@ -126,6 +126,63 @@ func ParseWebhook(data []byte) (*Webhook, error) {
 	return &hook, nil
 }
 
+func ParseEvent(data []byte) (*Webhook, error) {
+	hook, err := ParseWebhook(data)
+	if err != nil {
+		return nil, err
+	}
+	if hook.IsURLVerification() ||
+		hook.Header.EventType != "" ||
+		hook.Event.Message.MessageID != "" ||
+		hook.Event.Message.ChatID != "" ||
+		hook.Event.Sender.SenderID.OpenID != "" ||
+		hook.Event.Sender.SenderID.UserID != "" ||
+		hook.Event.Sender.SenderID.UnionID != "" {
+		return hook, nil
+	}
+
+	var flat struct {
+		AppID      string       `json:"app_id"`
+		EventID    string       `json:"event_id"`
+		EventType  string       `json:"event_type"`
+		Token      string       `json:"token"`
+		CreateTime string       `json:"create_time"`
+		TenantKey  string       `json:"tenant_key"`
+		Sender     EventSender  `json:"sender"`
+		Message    EventMessage `json:"message"`
+	}
+	if err := json.Unmarshal(data, &flat); err != nil {
+		return nil, fmt.Errorf("decode lark event: %w", err)
+	}
+	if flat.Message.MessageID == "" && flat.Message.ChatID == "" &&
+		flat.Sender.SenderID.OpenID == "" && flat.Sender.SenderID.UserID == "" && flat.Sender.SenderID.UnionID == "" {
+		return hook, nil
+	}
+	eventType := strings.TrimSpace(flat.EventType)
+	if eventType == "" {
+		eventType = strings.TrimSpace(hook.Type)
+	}
+	if eventType == "" {
+		eventType = EventTypeMessageReceive
+	}
+	return &Webhook{
+		Type:  eventType,
+		Token: flat.Token,
+		Header: EventHeader{
+			EventID:    flat.EventID,
+			EventType:  eventType,
+			AppID:      flat.AppID,
+			Token:      flat.Token,
+			CreateTime: flat.CreateTime,
+			TenantKey:  flat.TenantKey,
+		},
+		Event: MessageEvent{
+			Sender:  flat.Sender,
+			Message: flat.Message,
+		},
+	}, nil
+}
+
 func (h Webhook) IsURLVerification() bool {
 	return h.Type == "url_verification" && h.Challenge != ""
 }
@@ -156,6 +213,10 @@ func (h Webhook) VerifyToken(expected string) bool {
 }
 
 func (m EventMessage) Text() string {
+	return m.TextWithMentionFilter(nil)
+}
+
+func (m EventMessage) TextWithMentionFilter(strip func(Mention) bool) string {
 	if m.MessageType != "" && m.MessageType != "text" {
 		return ""
 	}
@@ -163,9 +224,9 @@ func (m EventMessage) Text() string {
 		Text string `json:"text"`
 	}
 	if err := json.Unmarshal([]byte(m.Content), &parsed); err == nil && parsed.Text != "" {
-		return normalizeText(parsed.Text)
+		return normalizeText(resolveMentionPlaceholders(parsed.Text, m.Mentions, strip))
 	}
-	return normalizeText(m.Content)
+	return normalizeText(resolveMentionPlaceholders(m.Content, m.Mentions, strip))
 }
 
 func (m EventMessage) ChatIdentity(senderOpenID string) ChatIdentity {
@@ -219,9 +280,34 @@ func ReceiveIDTypeForTarget(target string) string {
 	return "chat_id"
 }
 
-var atTagRE = regexp.MustCompile(`(?i)<at\s+[^>]*>(.*?)</at>`)
+var (
+	atTagRE    = regexp.MustCompile(`(?i)<at\s+[^>]*>(.*?)</at>`)
+	spaceRunRE = regexp.MustCompile(`[ \t]{2,}`)
+)
+
+func resolveMentionPlaceholders(text string, mentions []Mention, strip func(Mention) bool) string {
+	for _, mention := range mentions {
+		key := strings.TrimSpace(mention.Key)
+		if key == "" {
+			continue
+		}
+		replacement := ""
+		if strip != nil && strip(mention) {
+			text = strings.ReplaceAll(text, key, replacement)
+			continue
+		}
+		if key == "@_all" {
+			replacement = "@all"
+		} else if name := strings.TrimSpace(mention.Name); name != "" {
+			replacement = "@" + strings.TrimPrefix(name, "@")
+		}
+		text = strings.ReplaceAll(text, key, replacement)
+	}
+	return text
+}
 
 func normalizeText(text string) string {
 	text = atTagRE.ReplaceAllString(text, "$1")
+	text = spaceRunRE.ReplaceAllString(text, " ")
 	return strings.TrimSpace(text)
 }

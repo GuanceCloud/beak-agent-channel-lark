@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/GuanceCloud/beak-agent-channel-lark/sdk"
 )
@@ -32,10 +31,8 @@ func TestLarkScenarioMultipleAccountsShareGroupButUseSeparateSessions(t *testing
 		AccountStore:  store,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
-	defer cancel()
-	err := connector.Start(ctx, runtime)
-	if !errors.Is(err, context.DeadlineExceeded) {
+	err := connector.Start(context.Background(), runtime)
+	if err != nil {
 		t.Fatalf("Start error=%v", err)
 	}
 	if gateway.linkSession("account-a") == "" || gateway.linkSession("account-b") == "" {
@@ -289,10 +286,8 @@ func TestLarkScenarioCredentialInboundAndFixedReply(t *testing.T) {
 		HTTPClient:    httpClient,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
-	defer cancel()
-	err := connector.Start(ctx, runtime)
-	if !errors.Is(err, context.DeadlineExceeded) {
+	err := connector.Start(context.Background(), runtime)
+	if err != nil {
 		t.Fatalf("Start error=%v", err)
 	}
 
@@ -350,6 +345,200 @@ func TestLarkScenarioCredentialInboundAndFixedReply(t *testing.T) {
 	inboundSeen, ok := state["inbound_seen"].(map[string]string)
 	if !ok || inboundSeen["account-fixed:message:om-fixed-1"] == "" {
 		t.Fatalf("inbound seen=%+v", state["inbound_seen"])
+	}
+}
+
+func TestLarkScenarioMentionsInboundAndOutbound(t *testing.T) {
+	connector := NewConnector()
+	webhookConnector, ok := any(connector).(WebhookConnector)
+	if !ok {
+		t.Fatal("connector should implement WebhookConnector")
+	}
+	gateway := newScenarioGateway(Platform)
+	store := newScenarioStore()
+	account := scenarioLarkAccount("account-mention", "cli_mention", "secret_mention", "ou_bot_mention")
+	var sent scenarioLarkSentMessage
+	httpClient := &http.Client{Transport: scenarioRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			return scenarioJSONResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "token-mention", "expire": 7200})
+		case "/open-apis/im/v1/messages":
+			var body struct {
+				ReceiveID string `json:"receive_id"`
+				MsgType   string `json:"msg_type"`
+				Content   string `json:"content"`
+				UUID      string `json:"uuid"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			var content map[string]string
+			if err := json.Unmarshal([]byte(body.Content), &content); err != nil {
+				t.Fatal(err)
+			}
+			sent = scenarioLarkSentMessage{
+				receiveIDType: r.URL.Query().Get("receive_id_type"),
+				receiveID:     body.ReceiveID,
+				msgType:       body.MsgType,
+				uuid:          body.UUID,
+				text:          content["text"],
+			}
+			return scenarioJSONResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"message_id": "om-mention-reply", "chat_id": "oc_mentions"}})
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+		return nil, nil
+	})}
+	runtime := sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+		AccountStore:  store,
+		HTTPClient:    httpClient,
+	}
+	if err := connector.Start(context.Background(), runtime); err != nil {
+		t.Fatalf("Start error=%v", err)
+	}
+	result, err := webhookConnector.HandleWebhook(context.Background(), runtime, account, []byte(`{
+		"schema":"2.0",
+		"header":{"event_id":"evt-mention","event_type":"im.message.receive_v1","app_id":"cli_mention","token":"verify-token"},
+		"event":{
+			"sender":{"sender_id":{"open_id":"ou_user_mention"},"sender_type":"user"},
+			"message":{"message_id":"om-mention","chat_id":"oc_mentions","chat_type":"group","message_type":"text","content":"{\"text\":\"@_user_1 @所有人 帮我看下\"}","create_time":"1770000000200","mentions":[{"key":"@_user_1","id":{"open_id":"ou_bot_mention","user_id":"bot_user_mention"},"name":"Beak Bot"},{"key":"@_all","id":{},"name":"所有人"}]}
+		}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Inbound == nil || !result.Inbound.MentionedMe || !result.Inbound.MentionAll || len(result.Inbound.Mentions) != 3 {
+		t.Fatalf("inbound mention state=%+v", result.Inbound)
+	}
+
+	account.State = store.state("account-mention")
+	runtime.Account = account
+	sendResult, err := connector.Send(context.Background(), runtime, sdk.OutboundMessage{
+		AccountUUID: "account-mention",
+		ChatType:    sdk.ChatTypeGroup,
+		ChatID:      "oc_mentions",
+		Text:        "收到，我来处理",
+		MessageUUID: "agent-message-mention",
+		MentionAll:  true,
+		Mentions: []sdk.MentionIdentity{
+			{ID: "ou_user_mention", IDType: "open_id", DisplayName: "Alice"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantText := `<at user_id="all">Everyone</at> <at user_id="ou_user_mention">Alice</at>` + "\n收到，我来处理"
+	if sendResult.MessageID != "om-mention-reply" || sent.receiveIDType != "chat_id" || sent.receiveID != "oc_mentions" || sent.text != wantText {
+		t.Fatalf("send result=%+v sent=%+v want text=%q", sendResult, sent, wantText)
+	}
+}
+
+func TestLarkScenarioWebSocketEventDirectReply(t *testing.T) {
+	connector := NewConnector()
+	eventConnector, ok := any(connector).(EventConnector)
+	if !ok {
+		t.Fatal("connector should implement EventConnector")
+	}
+	gateway := newScenarioGateway(Platform)
+	store := newScenarioStore()
+	account := scenarioLarkAccount("account-ws", "cli_ws", "secret_ws", "ou_bot_ws")
+	var sent struct {
+		msgType       string
+		uuid          string
+		text          string
+		replyInThread bool
+	}
+	httpClient := &http.Client{Transport: scenarioRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["app_id"] != "cli_ws" || body["app_secret"] != "secret_ws" {
+				t.Fatalf("token body=%+v", body)
+			}
+			return scenarioJSONResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "token-ws", "expire": 7200})
+		case "/open-apis/im/v1/messages/om-direct-1/reply":
+			if got := r.Header.Get("Authorization"); got != "Bearer token-ws" {
+				t.Fatalf("authorization=%q", got)
+			}
+			var body struct {
+				MsgType       string `json:"msg_type"`
+				Content       string `json:"content"`
+				UUID          string `json:"uuid"`
+				ReplyInThread bool   `json:"reply_in_thread"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			var content map[string]string
+			if err := json.Unmarshal([]byte(body.Content), &content); err != nil {
+				t.Fatal(err)
+			}
+			sent.msgType = body.MsgType
+			sent.uuid = body.UUID
+			sent.text = content["text"]
+			sent.replyInThread = body.ReplyInThread
+			return scenarioJSONResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"message_id": "om-direct-reply", "chat_id": "oc_direct"}})
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+		return nil, nil
+	})}
+	runtime := sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+		AccountStore:  store,
+		HTTPClient:    httpClient,
+	}
+	if err := connector.Start(context.Background(), runtime); err != nil {
+		t.Fatalf("Start error=%v", err)
+	}
+	result, err := eventConnector.HandleEvent(context.Background(), runtime, account, []byte(`{
+		"app_id":"cli_ws",
+		"event_id":"evt-ws-direct-1",
+		"event_type":"im.message.receive_v1",
+		"sender":{"sender_id":{"open_id":"ou_direct_user"},"sender_type":"user"},
+		"message":{"message_id":"om-direct-1","chat_type":"p2p","message_type":"text","content":"{\"text\":\"direct websocket\"}","create_time":"1770000000300"}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Inbound == nil || result.Inbound.ChatType != sdk.ChatTypeDirect || result.Inbound.ChatID != "ou_direct_user" || result.Inbound.SenderID != "ou_direct_user" {
+		t.Fatalf("inbound=%+v", result.Inbound)
+	}
+	gateway.mu.Lock()
+	created := append([]sdk.CreateMessageRequest(nil), gateway.messages...)
+	gateway.mu.Unlock()
+	if len(created) != 1 || created[0].SenderID != "im:lark:direct:ou_direct_user:user:ou_direct_user" || created[0].Content != "direct websocket" {
+		t.Fatalf("created messages=%+v", created)
+	}
+
+	account.State = store.state("account-ws")
+	runtime.Account = account
+	sendResult, err := connector.Send(context.Background(), runtime, sdk.OutboundMessage{
+		AccountUUID: "account-ws",
+		ChatType:    result.Inbound.ChatType,
+		ChatID:      result.Inbound.ChatID,
+		Text:        "direct reply",
+		MessageUUID: "agent-message-direct",
+		Raw: map[string]any{
+			"reply_to_message_id": "om-direct-1",
+			"reply_in_thread":     true,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sendResult.MessageID != "om-direct-reply" || sent.msgType != "text" || sent.uuid != "agent-message-direct" || sent.text != "direct reply" || !sent.replyInThread {
+		t.Fatalf("send result=%+v sent=%+v", sendResult, sent)
 	}
 }
 
@@ -471,6 +660,10 @@ func (s *scenarioStore) SaveChannelAccountState(ctx context.Context, accountUUID
 	}
 	s.states[accountUUID] = copied
 	return nil
+}
+
+func (s *scenarioStore) LoadChannelAccountState(ctx context.Context, accountUUID string) (map[string]any, error) {
+	return s.state(accountUUID), nil
 }
 
 func (s *scenarioStore) state(accountUUID string) map[string]any {

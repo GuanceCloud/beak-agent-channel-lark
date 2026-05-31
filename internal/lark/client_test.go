@@ -235,6 +235,24 @@ func TestParseWebhookText(t *testing.T) {
 	}
 }
 
+func TestEventMessageTextResolvesMentionPlaceholders(t *testing.T) {
+	msg := EventMessage{
+		MessageType: "text",
+		Content:     `{"text":"@_user_1 ping @_bot @_all"}`,
+		Mentions: []Mention{
+			{Key: "@_user_1", ID: SenderID{OpenID: "ou_user"}, Name: "Alice"},
+			{Key: "@_bot", ID: SenderID{OpenID: "ou_bot"}, Name: "Bot"},
+			{Key: "@_all", Name: "所有人"},
+		},
+	}
+	got := msg.TextWithMentionFilter(func(mention Mention) bool {
+		return mention.ID.OpenID == "ou_bot"
+	})
+	if got != "@Alice ping @all" {
+		t.Fatalf("text=%q", got)
+	}
+}
+
 func TestParseURLVerification(t *testing.T) {
 	hook, err := ParseWebhook([]byte(`{"type":"url_verification","challenge":"challenge-1","token":"verify-token"}`))
 	if err != nil {

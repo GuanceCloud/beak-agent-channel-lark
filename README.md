@@ -4,18 +4,18 @@
 
 Go SDK package for connecting Beak Channel Gateway to Lark/Feishu bot accounts.
 
-This repository is importable library code. It is not a CLI, does not read user-authored runtime files, does not own persistence, and does not require users to edit server files. The Beak host owns UI, credential persistence, account state persistence, webhook routing, session creation, message writes, agent stream subscription, and runtime packaging. This SDK owns the Lark/Feishu connector logic: credential schema, event challenge handling, webhook signature/decryption helpers, text webhook normalization, message dedupe, token handling, and outbound delivery through Lark/Feishu Open APIs.
+This repository is importable library code. It is not a CLI, does not read user-authored runtime files, does not own persistence, and does not require users to edit server files. The Beak host owns UI, credential persistence, account state persistence, the Lark/Feishu WebSocket event client, event routing, session creation, message writes, agent stream subscription, and runtime packaging. This SDK owns the Lark/Feishu connector logic: credential schema, WebSocket event payload normalization, optional HTTP callback challenge/signature/decryption helpers, message dedupe, token handling, and outbound delivery through Lark/Feishu Open APIs.
 
 ## Scope
 
 - Generic `sdk.Connector` implementation exposed by `beaklark.NewConnector()`.
 - Credential-based Lark/Feishu bot account setup.
 - Host-backed credential and state persistence.
-- Text-only inbound `im.message.receive_v1` webhook events to Beak sessions.
+- Text-only inbound `im.message.receive_v1` WebSocket events to Beak sessions.
 - Text Beak agent output back to Lark/Feishu through `im/v1/messages`.
 - Raw outbound `msg_type`/`content` delivery for host-mapped Lark message types.
 - Optional reply delivery through `im/v1/messages/{message_id}/reply`.
-- Encrypted webhook body decryption and request signature verification when `encrypt_key` is configured.
+- Optional encrypted HTTP callback body decryption and request signature verification when `encrypt_key` is configured.
 - Direct chat and group chat normalization.
 - One connected bot account plus one group chat maps to one Beak session; one connected bot account plus one direct chat maps to one Beak session.
 - If multiple bot accounts are in the same group, each account creates or reuses its own Beak session for that group.
@@ -27,7 +27,7 @@ Out of v1 scope: first-class media upload/download helpers, voice, typing status
 
 - `sdk`: generic Beak Connector Plugin SDK interfaces and message types.
 - package root: Lark/Feishu connector implementation.
-- `internal/lark`: Lark/Feishu Open API HTTP client and webhook event models.
+- `internal/lark`: Lark/Feishu Open API HTTP client and event models.
 - `state`: account-scoped connector state helpers.
 - `examples/basic`: minimal host-side import skeleton.
 
@@ -44,7 +44,18 @@ func LarkConnector() sdk.Connector {
 }
 ```
 
-The connector also implements `beaklark.WebhookConnector`:
+The connector also implements `beaklark.EventConnector` for host-owned WebSocket event runtimes:
+
+```go
+type EventConnector interface {
+	sdk.Connector
+	HandleEvent(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, body []byte) (*beaklark.EventResult, error)
+}
+```
+
+`HandleEvent` accepts the SDK-flattened event payload produced by the Lark WebSocket `EventDispatcher`.
+
+For HTTP event callback compatibility, the connector also implements `beaklark.WebhookConnector`:
 
 ```go
 type WebhookConnector interface {
@@ -62,7 +73,7 @@ type WebhookRequestConnector interface {
 }
 ```
 
-Beak host should type assert one of these interfaces when routing the Lark/Feishu event callback endpoint.
+Beak host should use `EventConnector` for the OpenClaw-aligned WebSocket path. Use `WebhookRequestConnector` only when the host exposes an HTTP callback endpoint.
 
 ## Credential Schema
 
@@ -96,36 +107,37 @@ runtime := sdk.Runtime{
 }
 ```
 
-`Start(ctx, runtime)` validates account wiring and creates or reuses a channel-link session for each account. Lark/Feishu inbound events are delivered by Beak host's webhook endpoint through `HandleWebhook`; `Start` does not start a CLI, read config files, or own a local event server.
+`Start(ctx, runtime)` validates account wiring, creates or reuses a channel-link session for each account, persists the account state, and then returns. Lark/Feishu inbound events are received by the Beak host's WebSocket event runtime and passed to `HandleEvent`; `Start` does not start a CLI, read config files, subscribe to Beak agent streams, own the WebSocket client, or own a local event server.
 
-## Webhook Handling
+## Event Handling
 
-Beak host should expose an HTTPS callback endpoint for Lark/Feishu event subscription, load the target `channel_account`, and pass the raw request body to the SDK:
+OpenClaw's Lark implementation uses a per-account WebSocket client and registers `im.message.receive_v1` with the Lark `EventDispatcher`. The Beak host should mirror that ownership: keep the WebSocket connection in the host runtime, load the target `channel_account`, and pass the decoded event body to the SDK:
 
 ```go
 connector := beaklark.NewConnector()
-result, err := connector.HandleWebhook(ctx, runtime, account, requestBody)
+
+eventConnector, ok := connector.(beaklark.EventConnector)
+if !ok {
+	return errors.New("lark connector does not handle events")
+}
+
+result, err := eventConnector.HandleEvent(ctx, runtime, account, eventBody)
 if err != nil {
 	return err
 }
-if result.Challenge != "" {
-	// Return {"challenge": result.Challenge} to Lark/Feishu.
-}
 ```
 
-`HandleWebhook` supports:
+`HandleEvent` supports:
 
-- URL verification challenge.
-- Plaintext and encrypted `im.message.receive_v1` text events.
-- Verification token checks when `verification_token` exists.
-- Signature verification through `HandleWebhookRequest` when Lark/Feishu signature headers are present.
+- SDK-flattened WebSocket `im.message.receive_v1` text events.
+- Already-decoded events from the host WebSocket runtime. The host's Lark `EventDispatcher` owns transport verification for this path.
 - Self-echo filtering when `bot_open_id` exists.
 - Standard `mentions` extraction and `mentioned_me` detection with `bot_open_id`.
 - Dedupe by message id or event id.
 - Session creation/reuse through `sdk.Gateway.EnsureChatSession`.
 - Beak message creation through `sdk.Gateway.CreateMessage`.
 
-If Beak host already terminates and verifies webhook requests itself, it can still call `HandleWebhook` with the raw body. If it wants the SDK to verify request headers, call `HandleWebhookRequest`.
+For an HTTP callback endpoint, call `HandleWebhookRequest` to verify request headers or `HandleWebhook` when the host already verified and decrypted the request. The HTTP callback path checks `verification_token` when configured. That path is compatibility support; the OpenClaw reference runtime is WebSocket-first.
 
 ## Sending Text
 
@@ -201,7 +213,7 @@ source_id=lark:account_b:group:oc_group
 
 ## State Rules
 
-Beak host stores account state. The SDK only writes through `sdk.AccountStore.SaveChannelAccountState`:
+Beak host stores account state. The SDK reads and writes through `sdk.AccountStore`:
 
 - `channel_link_session`: connection session for this bot account.
 - `peer_sessions`: chat identity to Beak session uuid cache.

@@ -8,21 +8,27 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/GuanceCloud/beak-agent-channel-lark/sdk"
 )
 
 func TestLarkConnectorMetadataAndSchema(t *testing.T) {
-	connector := NewConnector()
-	var _ sdk.Connector = connector
+	var connector sdk.Connector = NewConnector()
+	if _, ok := connector.(EventConnector); !ok {
+		t.Fatal("NewConnector should expose EventConnector for host-owned Lark WebSocket routing")
+	}
+	if _, ok := connector.(WebhookConnector); !ok {
+		t.Fatal("NewConnector should expose WebhookConnector for HTTP callback compatibility")
+	}
+	if _, ok := connector.(WebhookRequestConnector); !ok {
+		t.Fatal("NewConnector should expose WebhookRequestConnector for signed HTTP callback compatibility")
+	}
 
 	metadata := connector.Metadata()
 	if metadata.ID != ID || metadata.Platform != Platform || metadata.Label != "Lark/Feishu" {
@@ -50,20 +56,45 @@ func TestLarkConnectorMetadataAndSchema(t *testing.T) {
 	}
 }
 
+func newTestEventConnector(t *testing.T) EventConnector {
+	t.Helper()
+	connector, ok := NewConnector().(EventConnector)
+	if !ok {
+		t.Fatal("NewConnector should expose EventConnector")
+	}
+	return connector
+}
+
+func newTestWebhookConnector(t *testing.T) WebhookConnector {
+	t.Helper()
+	connector, ok := NewConnector().(WebhookConnector)
+	if !ok {
+		t.Fatal("NewConnector should expose WebhookConnector")
+	}
+	return connector
+}
+
+func newTestWebhookRequestConnector(t *testing.T) WebhookRequestConnector {
+	t.Helper()
+	connector, ok := NewConnector().(WebhookRequestConnector)
+	if !ok {
+		t.Fatal("NewConnector should expose WebhookRequestConnector")
+	}
+	return connector
+}
+
 func TestLarkConnectorStartEnsuresChannelLink(t *testing.T) {
 	connector := NewConnector()
 	gateway := &fakeSDKGateway{}
 	store := newFakeSDKAccountStore()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
-	defer cancel()
-	err := connector.Start(ctx, sdk.Runtime{
+	err := connector.Start(context.Background(), sdk.Runtime{
 		WorkspaceUUID: "workspace-1",
 		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
 		Account:       sdkAccount("account-1", "cli_1", "secret_1", ""),
 		Gateway:       gateway,
 		AccountStore:  store,
 	})
-	if !errors.Is(err, context.DeadlineExceeded) {
+	if err != nil {
 		t.Fatalf("Start error=%v", err)
 	}
 	if gateway.channelPlatform != Platform {
@@ -78,7 +109,7 @@ func TestLarkConnectorStartEnsuresChannelLink(t *testing.T) {
 }
 
 func TestLarkConnectorWebhookChallenge(t *testing.T) {
-	connector := NewConnector()
+	connector := newTestWebhookConnector(t)
 	result, err := connector.HandleWebhook(context.Background(), sdk.Runtime{}, sdkAccount("account-1", "cli_1", "secret_1", ""), []byte(`{"type":"url_verification","challenge":"challenge-1","token":"verify-token"}`))
 	if err != nil {
 		t.Fatal(err)
@@ -89,7 +120,7 @@ func TestLarkConnectorWebhookChallenge(t *testing.T) {
 }
 
 func TestLarkConnectorEncryptedWebhookChallenge(t *testing.T) {
-	connector := NewConnector()
+	connector := newTestWebhookConnector(t)
 	account := sdkAccount("account-1", "cli_1", "secret_1", "")
 	account.Credential["encrypt_key"] = "encrypt-key"
 	plain := `{"type":"url_verification","challenge":"challenge-1","token":"verify-token"}`
@@ -104,7 +135,7 @@ func TestLarkConnectorEncryptedWebhookChallenge(t *testing.T) {
 }
 
 func TestLarkConnectorWebhookRequestVerifiesSignature(t *testing.T) {
-	connector := NewConnector()
+	connector := newTestWebhookRequestConnector(t)
 	account := sdkAccount("account-1", "cli_1", "secret_1", "")
 	account.Credential["encrypt_key"] = "encrypt-key"
 	body := []byte(`{"type":"url_verification","challenge":"challenge-1","token":"verify-token"}`)
@@ -126,7 +157,7 @@ func TestLarkConnectorWebhookRequestVerifiesSignature(t *testing.T) {
 }
 
 func TestLarkConnectorWebhookCreatesMessageAndDedupes(t *testing.T) {
-	connector := NewConnector()
+	connector := newTestWebhookConnector(t)
 	gateway := &fakeSDKGateway{}
 	store := newFakeSDKAccountStore()
 	account := sdkAccount("account-1", "cli_1", "secret_1", "")
@@ -187,6 +218,161 @@ func TestLarkConnectorWebhookCreatesMessageAndDedupes(t *testing.T) {
 	defer gateway.mu.Unlock()
 	if len(gateway.messages) != 1 {
 		t.Fatalf("duplicate created message=%+v", gateway.messages)
+	}
+}
+
+func TestLarkConnectorHandleEventAcceptsWebSocketEvent(t *testing.T) {
+	connector := newTestEventConnector(t)
+	gateway := &fakeSDKGateway{}
+	store := newFakeSDKAccountStore()
+	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	body := []byte(`{
+		"app_id":"cli_1",
+		"event_id":"evt_1",
+		"event_type":"im.message.receive_v1",
+		"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
+		"message":{"message_id":"om_1","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"hello websocket\"}","create_time":"1770000000000"}
+	}`)
+	result, err := connector.HandleEvent(context.Background(), sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+		AccountStore:  store,
+	}, account, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Ignored || result.Type != "im.message.receive_v1" || result.MessageUUID != "message-1" {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(gateway.messages) != 1 || gateway.messages[0].Content != "hello websocket" {
+		t.Fatalf("messages=%+v", gateway.messages)
+	}
+}
+
+func TestLarkConnectorHandleEventAcceptsFlatEventWithTypeAndUserID(t *testing.T) {
+	connector := newTestEventConnector(t)
+	gateway := &fakeSDKGateway{}
+	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	body := []byte(`{
+		"type":"im.message.receive_v1",
+		"app_id":"cli_1",
+		"event_id":"evt_user_id",
+		"sender":{"sender_id":{"user_id":"user_direct"},"sender_type":"user"},
+		"message":{"message_id":"om_user_id","chat_type":"p2p","message_type":"text","content":"{\"text\":\"hello user id\"}","create_time":"1770000000000"}
+	}`)
+	result, err := connector.HandleEvent(context.Background(), sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+		AccountStore:  newFakeSDKAccountStore(),
+	}, account, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Ignored || result.Type != "im.message.receive_v1" || result.Inbound == nil || result.Inbound.ChatID != "user_direct" || result.Inbound.SenderID != "user_direct" {
+		t.Fatalf("result=%+v inbound=%+v", result, result.Inbound)
+	}
+	if len(gateway.messages) != 1 || gateway.messages[0].Content != "hello user id" {
+		t.Fatalf("messages=%+v", gateway.messages)
+	}
+}
+
+func TestLarkConnectorHandleEventUsesLoadedBotIdentity(t *testing.T) {
+	connector := newTestEventConnector(t)
+	gateway := &fakeSDKGateway{}
+	store := newFakeSDKAccountStore()
+	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	delete(account.Credential, "bot_open_id")
+	if err := store.SaveChannelAccountState(context.Background(), "account-1", map[string]any{
+		"bot_open_id": "ou_bot_loaded",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{
+		"app_id":"cli_1",
+		"event_id":"evt_self_loaded",
+		"event_type":"im.message.receive_v1",
+		"sender":{"sender_id":{"open_id":"ou_bot_loaded"},"sender_type":"user"},
+		"message":{"message_id":"om_self_loaded","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"self echo\"}","create_time":"1770000000000"}
+	}`)
+	result, err := connector.HandleEvent(context.Background(), sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+		AccountStore:  store,
+	}, account, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || !result.Ignored || result.Reason != "self_echo" {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(gateway.messages) != 0 {
+		t.Fatalf("messages=%+v", gateway.messages)
+	}
+}
+
+func TestLarkConnectorHandleEventRejectsMismatchedAppID(t *testing.T) {
+	connector := newTestEventConnector(t)
+	gateway := &fakeSDKGateway{}
+	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	body := []byte(`{
+		"app_id":"cli_other",
+		"event_id":"evt_1",
+		"event_type":"im.message.receive_v1",
+		"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
+		"message":{"message_id":"om_1","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"wrong app\"}","create_time":"1770000000000"}
+	}`)
+	result, err := connector.HandleEvent(context.Background(), sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+		AccountStore:  newFakeSDKAccountStore(),
+	}, account, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || !result.Ignored || result.Reason != "app_id_mismatch" {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(gateway.messages) != 0 {
+		t.Fatalf("messages=%+v", gateway.messages)
+	}
+}
+
+func TestLarkConnectorWebhookMentionAll(t *testing.T) {
+	connector := newTestWebhookConnector(t)
+	gateway := &fakeSDKGateway{}
+	store := newFakeSDKAccountStore()
+	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	body := []byte(`{
+		"schema":"2.0",
+		"header":{"event_id":"evt_all","event_type":"im.message.receive_v1","app_id":"cli_1","token":"verify-token"},
+		"event":{
+			"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
+			"message":{"message_id":"om_all","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"hello all\"}","create_time":"1770000000000","mentions":[{"key":"@_all","id":{},"name":"所有人"}]}
+		}
+	}`)
+	result, err := connector.HandleWebhook(context.Background(), sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+		AccountStore:  store,
+	}, account, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Inbound == nil || !result.Inbound.MentionAll || !result.Inbound.MentionedMe || len(result.Inbound.Mentions) != 1 {
+		t.Fatalf("inbound=%+v", result.Inbound)
+	}
+	if result.Inbound.Mentions[0].ID != "all" || result.Inbound.Mentions[0].IDType != "mention_all" {
+		t.Fatalf("mentions=%+v", result.Inbound.Mentions)
 	}
 }
 
@@ -254,6 +440,139 @@ func TestLarkConnectorSendUsesRequestedAccount(t *testing.T) {
 	}
 	if result.AccountUUID != "account-2" || result.Platform != Platform || result.MessageID != "om_reply" {
 		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestLarkConnectorSendPersistsTokenForEmptyState(t *testing.T) {
+	var tokenCalls int
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			tokenCalls++
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "tenant-empty-state", "expire": 7200})
+		case "/open-apis/im/v1/messages":
+			if got := r.Header.Get("Authorization"); got != "Bearer tenant-empty-state" {
+				t.Fatalf("auth=%q", got)
+			}
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"message_id": "om_empty", "chat_id": "oc_group"}})
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+		}
+		return nil, nil
+	})}
+	store := newFakeSDKAccountStore()
+	result, err := NewConnector().Send(context.Background(), sdk.Runtime{
+		HTTPClient:   httpClient,
+		Account:      sdkAccount("account-1", "cli_1", "secret_1", "https://open.feishu.test"),
+		AccountStore: store,
+	}, sdk.OutboundMessage{
+		AccountUUID: "account-1",
+		ChatType:    sdk.ChatTypeGroup,
+		ChatID:      "oc_group",
+		Text:        "reply",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tokenCalls != 1 || result.MessageID != "om_empty" {
+		t.Fatalf("tokenCalls=%d result=%+v", tokenCalls, result)
+	}
+	state := store.state("account-1")
+	if state["tenant_access_token"] != "tenant-empty-state" || state["tenant_access_token_expires_at"] == nil {
+		t.Fatalf("saved state=%+v", state)
+	}
+}
+
+func TestLarkConnectorSendTextMentions(t *testing.T) {
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "token-1", "expire": 7200})
+		case "/open-apis/im/v1/messages":
+			var body struct {
+				Content string `json:"content"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			var content map[string]string
+			if err := json.Unmarshal([]byte(body.Content), &content); err != nil {
+				t.Fatal(err)
+			}
+			want := `<at user_id="all">Everyone</at> <at user_id="ou_user">Alice</at>` + "\nreply"
+			if content["text"] != want {
+				t.Fatalf("content=%q want=%q", content["text"], want)
+			}
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"message_id": "om_reply", "chat_id": "oc_group"}})
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+		}
+		return nil, nil
+	})}
+
+	_, err := NewConnector().Send(context.Background(), sdk.Runtime{
+		HTTPClient: httpClient,
+		Account:    sdkAccount("account-1", "cli_1", "secret_1", "https://open.feishu.test"),
+	}, sdk.OutboundMessage{
+		AccountUUID: "account-1",
+		ChatType:    sdk.ChatTypeGroup,
+		ChatID:      "oc_group",
+		Text:        "reply",
+		MentionAll:  true,
+		Mentions: []sdk.MentionIdentity{
+			{ID: "ou_user", IDType: "open_id", DisplayName: "Alice"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLarkConnectorSendTextRawMentions(t *testing.T) {
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "token-1", "expire": 7200})
+		case "/open-apis/im/v1/messages":
+			var body struct {
+				Content string `json:"content"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			var content map[string]string
+			if err := json.Unmarshal([]byte(body.Content), &content); err != nil {
+				t.Fatal(err)
+			}
+			want := `<at user_id="all">Everyone</at> <at user_id="ou_list">ou_list</at> <at user_id="ou_raw">Bob</at>` + "\nreply"
+			if content["text"] != want {
+				t.Fatalf("content=%q want=%q", content["text"], want)
+			}
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"message_id": "om_reply", "chat_id": "oc_group"}})
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+		}
+		return nil, nil
+	})}
+
+	_, err := NewConnector().Send(context.Background(), sdk.Runtime{
+		HTTPClient: httpClient,
+		Account:    sdkAccount("account-1", "cli_1", "secret_1", "https://open.feishu.test"),
+	}, sdk.OutboundMessage{
+		AccountUUID: "account-1",
+		ChatType:    sdk.ChatTypeGroup,
+		ChatID:      "oc_group",
+		Text:        "reply",
+		Raw: map[string]any{
+			"mentionAll":  true,
+			"mention_ids": []any{"ou_list"},
+			"mentions": []any{
+				map[string]any{"id": "ou_raw", "display_name": "Bob"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -390,6 +709,12 @@ func (s *fakeSDKAccountStore) SaveChannelAccountState(ctx context.Context, accou
 	defer s.mu.Unlock()
 	s.states[accountUUID] = state
 	return nil
+}
+
+func (s *fakeSDKAccountStore) LoadChannelAccountState(ctx context.Context, accountUUID string) (map[string]any, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.states[accountUUID], nil
 }
 
 func (s *fakeSDKAccountStore) state(accountUUID string) map[string]any {
