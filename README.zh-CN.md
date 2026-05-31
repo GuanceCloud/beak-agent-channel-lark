@@ -4,7 +4,7 @@
 
 这是一个 Go SDK 包，用于把 Beak Channel Gateway 接入飞书/Lark bot account。
 
-本仓库提供的是可被 Beak host `import` 的库代码，不是命令行工具。SDK 不读取用户编写的运行时配置文件，不维护本地状态目录，不拥有数据库持久化，也不要求用户登录服务器修改文件。Beak host 负责客户端 UI、credential 持久化、account state 持久化、webhook 路由、session 创建、message 写入、agent stream 订阅和 connector runtime 打包。SDK 只负责飞书/Lark connector 逻辑：credential schema、事件挑战处理、webhook 签名/解密辅助、文本 webhook 标准化、消息去重、token 处理，以及通过飞书/Lark Open API 发送消息。
+本仓库提供的是可被 Beak host `import` 的库代码，不是命令行工具。SDK 不读取用户编写的运行时配置文件，不维护本地状态目录，不拥有数据库持久化，也不要求用户登录服务器修改文件。Beak host 负责客户端 UI、credential 持久化、account state 持久化、Lark/飞书 WebSocket event client、事件路由、session 创建、message 写入、agent stream 订阅和 connector runtime 打包。SDK 只负责飞书/Lark connector 逻辑：credential schema、WebSocket event payload 标准化、可选 HTTP callback challenge/签名/解密辅助、消息去重、token 处理，以及通过飞书/Lark Open API 发送消息。
 
 ## 范围
 
@@ -13,11 +13,11 @@ v1 支持：
 - 通过 `beaklark.NewConnector()` 暴露通用 `sdk.Connector` 实现。
 - 基于 credential 的飞书/Lark bot account 接入。
 - 由 Beak host 保存 credential 和 connector state。
-- 文本 `im.message.receive_v1` webhook 事件入站到 Beak session。
+- 文本 `im.message.receive_v1` WebSocket 事件入站到 Beak session。
 - Beak agent 文本输出通过 `im/v1/messages` 回发到飞书/Lark。
 - 支持由 Beak host 映射的 raw outbound `msg_type` / `content`。
 - 支持通过 `im/v1/messages/{message_id}/reply` 回复原消息。
-- 配置 `encrypt_key` 后，支持加密 webhook body 解密和请求签名校验。
+- 配置 `encrypt_key` 后，兼容 HTTP callback 的加密 body 解密和请求签名校验。
 - 单聊和群聊标准化。
 - 一个已连接 bot account 中的一个群聊对应一个 Beak session。
 - 一个已连接 bot account 中的一个单聊对应一个 Beak session。
@@ -37,7 +37,7 @@ v1 不支持：
 
 - `sdk`：通用 Beak Connector Plugin SDK 接口和消息类型。
 - 根包：飞书/Lark connector 实现。
-- `internal/lark`：飞书/Lark Open API HTTP client 和 webhook 事件模型。
+- `internal/lark`：飞书/Lark Open API HTTP client 和事件模型。
 - `state`：account 维度的 connector state helper。
 - `examples/basic`：最小 host-side import skeleton。
 
@@ -54,7 +54,18 @@ func LarkConnector() sdk.Connector {
 }
 ```
 
-该 connector 同时实现 `beaklark.WebhookConnector`：
+该 connector 同时实现 `beaklark.EventConnector`，用于 host-owned WebSocket event runtime：
+
+```go
+type EventConnector interface {
+	sdk.Connector
+	HandleEvent(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, body []byte) (*beaklark.EventResult, error)
+}
+```
+
+`HandleEvent` 接收 Lark WebSocket `EventDispatcher` 解码后的 SDK-flattened event payload。
+
+为了兼容 HTTP event callback，connector 也实现 `beaklark.WebhookConnector`：
 
 ```go
 type WebhookConnector interface {
@@ -72,7 +83,7 @@ type WebhookRequestConnector interface {
 }
 ```
 
-Beak host 在路由飞书/Lark 事件回调 endpoint 时，可以按接入方式 type assert 对应接口。
+OpenClaw 对齐的 WebSocket 主链路应 type assert `EventConnector`。只有 host 暴露 HTTP callback endpoint 时，才使用 `WebhookRequestConnector`。
 
 ## Credential Schema
 
@@ -106,36 +117,37 @@ runtime := sdk.Runtime{
 }
 ```
 
-`Start(ctx, runtime)` 负责校验 account wiring，并为每个 account 创建或复用 channel-link session。飞书/Lark 入站事件由 Beak host 的 webhook endpoint 收到后调用 `HandleWebhook`。`Start` 不启动 CLI，不读取配置文件，也不拥有本地事件服务器。
+`Start(ctx, runtime)` 负责校验 account wiring，为每个 account 创建或复用 channel-link session，保存 account state，然后返回。飞书/Lark 入站事件由 Beak host 的 WebSocket event runtime 收到后调用 `HandleEvent`。`Start` 不启动 CLI，不读取配置文件，不订阅 Beak agent stream，不拥有 WebSocket client，也不拥有本地事件服务器。
 
-## Webhook 处理
+## 事件处理
 
-Beak host 应暴露一个 HTTPS callback endpoint 给飞书/Lark 事件订阅使用，加载对应 `channel_account` 后，把原始 request body 传给 SDK：
+OpenClaw 的 Lark 实现是 per-account WebSocket client，并在 Lark `EventDispatcher` 上注册 `im.message.receive_v1`。Beak host 应复用这个边界：host 持有 WebSocket 连接，加载对应 `channel_account` 后，把解码后的 event body 传给 SDK：
 
 ```go
 connector := beaklark.NewConnector()
-result, err := connector.HandleWebhook(ctx, runtime, account, requestBody)
+
+eventConnector, ok := connector.(beaklark.EventConnector)
+if !ok {
+	return errors.New("lark connector does not handle events")
+}
+
+result, err := eventConnector.HandleEvent(ctx, runtime, account, eventBody)
 if err != nil {
 	return err
 }
-if result.Challenge != "" {
-	// 向飞书/Lark 返回 {"challenge": result.Challenge}
-}
 ```
 
-`HandleWebhook` 支持：
+`HandleEvent` 支持：
 
-- URL verification challenge。
-- 明文和加密 `im.message.receive_v1` 文本事件。
-- 配置了 `verification_token` 时进行 token 校验。
-- 通过 `HandleWebhookRequest` 校验飞书/Lark 请求签名。
+- SDK-flattened WebSocket `im.message.receive_v1` 文本事件。
+- host WebSocket runtime 已解码的事件；该路径的传输校验由 host 的 Lark `EventDispatcher` 负责。
 - 配置了 `bot_open_id` 时过滤 self echo。
 - 标准化提取 `mentions`，并用 `bot_open_id` 判断 `mentioned_me`。
 - 按 message id 或 event id 去重。
 - 通过 `sdk.Gateway.EnsureChatSession` 创建或复用 session。
 - 通过 `sdk.Gateway.CreateMessage` 写入 Beak message。
 
-如果 Beak host 已经自行完成请求验签和解密，可以继续调用 `HandleWebhook`。如果希望由 SDK 校验请求 header，则调用 `HandleWebhookRequest`。
+如果 host 使用 HTTP callback endpoint，可以调用 `HandleWebhookRequest` 让 SDK 校验请求 header；如果 host 已经自行验签和解密，可以调用 `HandleWebhook`。HTTP callback 路径会在配置 `verification_token` 时校验 token。这只是兼容入口，OpenClaw 参考实现的主链路是 WebSocket-first。
 
 ## 发送文本
 
@@ -211,7 +223,7 @@ source_id=lark:account_b:group:oc_group
 
 ## State 规则
 
-Beak host 保存 account state，SDK 只通过 `sdk.AccountStore.SaveChannelAccountState` 回写：
+Beak host 保存 account state，SDK 通过 `sdk.AccountStore` 读取并回写：
 
 - `channel_link_session`：该 bot account 对应的连接 session。
 - `peer_sessions`：chat identity 到 Beak session uuid 的缓存。

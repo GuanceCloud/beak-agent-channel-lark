@@ -13,6 +13,8 @@ type AccountState struct {
 	TenantAccessToken  string            `json:"tenant_access_token,omitempty"`
 	TokenExpiresAt     time.Time         `json:"tenant_access_token_expires_at,omitempty"`
 	BotOpenID          string            `json:"bot_open_id,omitempty"`
+	BotUserID          string            `json:"bot_user_id,omitempty"`
+	BotUnionID         string            `json:"bot_union_id,omitempty"`
 	ChannelLinkSession string            `json:"channel_link_session,omitempty"`
 	PeerSessions       map[string]string `json:"peer_sessions,omitempty"`
 	InboundSeen        map[string]string `json:"inbound_seen,omitempty"`

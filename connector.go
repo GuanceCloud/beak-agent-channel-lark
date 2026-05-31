@@ -32,9 +32,16 @@ type WebhookResult struct {
 	Inbound     *sdk.InboundMessage `json:"inbound,omitempty"`
 }
 
+type EventResult = WebhookResult
+
 type WebhookConnector interface {
 	sdk.Connector
 	HandleWebhook(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, body []byte) (*WebhookResult, error)
+}
+
+type EventConnector interface {
+	sdk.Connector
+	HandleEvent(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, body []byte) (*EventResult, error)
 }
 
 type WebhookRequestConnector interface {
@@ -42,7 +49,7 @@ type WebhookRequestConnector interface {
 	HandleWebhookRequest(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, req *http.Request) (*WebhookResult, error)
 }
 
-func NewConnector() Connector {
+func NewConnector() sdk.Connector {
 	return Connector{channel: Channel{}}
 }
 
@@ -123,19 +130,18 @@ func (c Connector) Start(ctx context.Context, runtime sdk.Runtime) error {
 		if err != nil {
 			return err
 		}
-		state, err := store.LoadAccount(accountUUID)
+		state, err := store.LoadAccount(ctx, accountUUID)
 		if err != nil {
 			return err
 		}
 		if state.ChannelLinkSession != sessionUUID {
 			state.ChannelLinkSession = sessionUUID
-			if err := store.SaveAccount(state); err != nil {
+			if err := store.SaveAccount(ctx, state); err != nil {
 				return err
 			}
 		}
 	}
-	<-ctx.Done()
-	return ctx.Err()
+	return nil
 }
 
 func (c Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.OutboundMessage) (*sdk.SendResult, error) {
@@ -146,7 +152,7 @@ func (c Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.Outbou
 	accountUUID := accountKey(account)
 	store := newConnectorStateStore(runtime.AccountStore)
 	store.seed(account)
-	accountState, err := store.LoadAccount(accountUUID)
+	accountState, err := store.LoadAccount(ctx, accountUUID)
 	if err != nil {
 		return nil, err
 	}
@@ -163,10 +169,8 @@ func (c Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.Outbou
 		}
 		accountState.TenantAccessToken = token
 		accountState.TokenExpiresAt = expiresAt
-		if len(account.State) > 0 {
-			if err := store.SaveAccount(accountState); err != nil {
-				return nil, err
-			}
+		if err := store.SaveAccount(ctx, accountState); err != nil {
+			return nil, err
 		}
 	}
 	target := strings.TrimSpace(req.ChatID)
@@ -219,7 +223,7 @@ func (c Connector) HandleWebhook(ctx context.Context, runtime sdk.Runtime, accou
 	if err != nil {
 		return nil, err
 	}
-	hook, err := lark.ParseWebhook(decoded)
+	hook, err := lark.ParseEvent(decoded)
 	if err != nil {
 		return nil, err
 	}
@@ -232,7 +236,18 @@ func (c Connector) HandleWebhook(ctx context.Context, runtime sdk.Runtime, accou
 	if hook.EventType() != lark.EventTypeMessageReceive {
 		return &WebhookResult{Type: hook.EventType(), Ignored: true, Reason: "unsupported_event_type"}, nil
 	}
-	return c.processMessageEvent(ctx, runtime, account, hook)
+	return c.processMessageEvent(ctx, runtime, account, hook, true)
+}
+
+func (c Connector) HandleEvent(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, body []byte) (*EventResult, error) {
+	hook, err := lark.ParseEvent(body)
+	if err != nil {
+		return nil, err
+	}
+	if hook.EventType() != lark.EventTypeMessageReceive {
+		return &WebhookResult{Type: hook.EventType(), Ignored: true, Reason: "unsupported_event_type"}, nil
+	}
+	return c.processMessageEvent(ctx, runtime, account, hook, false)
 }
 
 func (c Connector) HandleWebhookRequest(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, req *http.Request) (*WebhookResult, error) {
@@ -258,33 +273,37 @@ func (c Connector) HandleWebhookRequest(ctx context.Context, runtime sdk.Runtime
 	return c.HandleWebhook(ctx, runtime, account, body)
 }
 
-func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, hook *lark.Webhook) (*WebhookResult, error) {
+func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, hook *lark.Webhook, verifyToken bool) (*WebhookResult, error) {
 	if runtime.Gateway == nil {
-		return nil, fmt.Errorf("lark webhook handling requires sdk.Runtime.Gateway")
+		return nil, fmt.Errorf("lark event handling requires sdk.Runtime.Gateway")
 	}
-	if !hook.VerifyToken(stringValue(account.Credential["verification_token"])) {
+	if verifyToken && !hook.VerifyToken(stringValue(account.Credential["verification_token"])) {
 		return nil, fmt.Errorf("lark webhook verification token mismatch")
+	}
+	if !larkEventOwnershipValid(account, hook) {
+		return &WebhookResult{Type: hook.EventType(), Ignored: true, Reason: "app_id_mismatch"}, nil
 	}
 	accountUUID := accountKey(account)
 	if accountUUID == "" {
 		return nil, fmt.Errorf("lark account_uuid or app_id is required")
 	}
-	botOpenID := firstString(account.Credential["bot_open_id"], account.State["bot_open_id"])
-	senderID := strings.TrimSpace(hook.Event.Sender.SenderID.OpenID)
-	if botOpenID != "" && senderID == botOpenID {
+	store := newConnectorStateStore(runtime.AccountStore)
+	store.seed(account)
+	state, err := store.LoadAccount(ctx, accountUUID)
+	if err != nil {
+		return nil, err
+	}
+	bot := larkBotIdentityFromAccountState(account, state)
+	senderID := larkSenderID(hook.Event.Sender.SenderID)
+	if larkSenderMatchesBot(hook.Event.Sender.SenderID, bot) {
 		return &WebhookResult{Type: hook.EventType(), Ignored: true, Reason: "self_echo"}, nil
 	}
-	text := hook.Event.Message.Text()
+	text := hook.Event.Message.TextWithMentionFilter(func(mention lark.Mention) bool {
+		return larkMentionMatchesBot(mention, bot)
+	})
 	chat := hook.Event.Message.ChatIdentity(senderID)
 	if chat.ChatType == "" || chat.ChatID == "" || chat.SenderID == "" || text == "" {
 		return &WebhookResult{Type: hook.EventType(), Ignored: true, Reason: "incomplete_or_non_text_message"}, nil
-	}
-
-	store := newConnectorStateStore(runtime.AccountStore)
-	store.seed(account)
-	state, err := store.LoadAccount(accountUUID)
-	if err != nil {
-		return nil, err
 	}
 	key := hook.DedupeKey(accountUUID)
 	if _, ok := state.InboundSeen[key]; ok {
@@ -308,7 +327,7 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 	if err != nil {
 		return nil, err
 	}
-	inbound := buildInboundMessage(runtime.WorkspaceUUID, runtime.Channel.UUID, accountUUID, hook, text, botOpenID)
+	inbound := buildInboundMessage(runtime.WorkspaceUUID, runtime.Channel.UUID, accountUUID, hook, text, bot)
 	messageUUID, err := runtime.Gateway.CreateMessage(ctx, sdk.CreateMessageRequest{
 		WorkspaceUUID: runtime.WorkspaceUUID,
 		SessionUUID:   sessionUUID,
@@ -337,20 +356,21 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 	}
 	state.PeerSessions[chat.StateKey()] = sessionUUID
 	state.InboundSeen[key] = time.Now().UTC().Format(time.RFC3339Nano)
-	if err := store.SaveAccount(state); err != nil {
+	if err := store.SaveAccount(ctx, state); err != nil {
 		return nil, err
 	}
 	return &WebhookResult{Type: hook.EventType(), SessionUUID: sessionUUID, MessageUUID: messageUUID, Inbound: &inbound}, nil
 }
 
 func BuildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *lark.Webhook, text string) sdk.InboundMessage {
-	return buildInboundMessage(workspaceUUID, channelUUID, accountUUID, hook, text, "")
+	return buildInboundMessage(workspaceUUID, channelUUID, accountUUID, hook, text, larkBotIdentity{})
 }
 
-func buildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *lark.Webhook, text, botOpenID string) sdk.InboundMessage {
-	senderID := strings.TrimSpace(hook.Event.Sender.SenderID.OpenID)
+func buildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *lark.Webhook, text string, bot larkBotIdentity) sdk.InboundMessage {
+	senderID := larkSenderID(hook.Event.Sender.SenderID)
 	chat := hook.Event.Message.ChatIdentity(senderID)
 	mentions := larkMentionIdentities(hook.Event.Message.Mentions)
+	mentionAll := larkMentionsAll(hook.Event.Message.Mentions)
 	return sdk.InboundMessage{
 		WorkspaceUUID: workspaceUUID,
 		Platform:      Platform,
@@ -363,7 +383,8 @@ func buildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *l
 		Text:          text,
 		DedupeKey:     hook.DedupeKey(accountUUID),
 		Mentions:      mentions,
-		MentionedMe:   larkMentionsBot(mentions, botOpenID),
+		MentionedMe:   mentionAll || larkMentionsBot(mentions, bot),
+		MentionAll:    mentionAll,
 		Raw: map[string]any{
 			"event_id":     hook.EventID(),
 			"event_type":   hook.EventType(),
@@ -378,6 +399,7 @@ func buildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *l
 			"sender_id":    hook.Event.Sender.SenderID,
 			"create_time":  hook.Event.Message.CreateTime,
 			"mentions":     hook.Event.Message.Mentions,
+			"mention_all":  mentionAll,
 		},
 	}
 }
@@ -386,6 +408,13 @@ func larkMentionIdentities(mentions []lark.Mention) []sdk.MentionIdentity {
 	out := make([]sdk.MentionIdentity, 0, len(mentions)*3)
 	for _, mention := range mentions {
 		displayName := strings.TrimSpace(mention.Name)
+		if larkMentionIsAll(mention) {
+			if displayName == "" {
+				displayName = "all"
+			}
+			out = append(out, sdk.MentionIdentity{ID: "all", IDType: "mention_all", DisplayName: displayName})
+			continue
+		}
 		if id := strings.TrimSpace(mention.ID.OpenID); id != "" {
 			out = append(out, sdk.MentionIdentity{ID: id, IDType: "open_id", DisplayName: displayName})
 		}
@@ -399,14 +428,92 @@ func larkMentionIdentities(mentions []lark.Mention) []sdk.MentionIdentity {
 	return uniqueMentionIdentities(out)
 }
 
-func larkMentionsBot(mentions []sdk.MentionIdentity, botOpenID string) bool {
-	botOpenID = strings.TrimSpace(botOpenID)
-	if botOpenID == "" {
-		return false
-	}
+func larkMentionsAll(mentions []lark.Mention) bool {
 	for _, mention := range mentions {
-		if strings.TrimSpace(mention.ID) == botOpenID && (mention.IDType == "" || mention.IDType == "open_id") {
+		if larkMentionIsAll(mention) {
 			return true
+		}
+	}
+	return false
+}
+
+func larkMentionIsAll(mention lark.Mention) bool {
+	return strings.TrimSpace(mention.Key) == "@_all"
+}
+
+type larkBotIdentity struct {
+	OpenID  string
+	UserID  string
+	UnionID string
+}
+
+func larkEventOwnershipValid(account sdk.ChannelAccount, hook *lark.Webhook) bool {
+	expected := strings.TrimSpace(stringValue(account.Credential["app_id"]))
+	if expected == "" || hook == nil {
+		return true
+	}
+	received := strings.TrimSpace(hook.Header.AppID)
+	if received == "" {
+		return true
+	}
+	return received == expected
+}
+
+func larkBotIdentityFromAccount(account sdk.ChannelAccount) larkBotIdentity {
+	return larkBotIdentity{
+		OpenID:  firstString(account.Credential["bot_open_id"], account.State["bot_open_id"]),
+		UserID:  firstString(account.Credential["bot_user_id"], account.State["bot_user_id"]),
+		UnionID: firstString(account.Credential["bot_union_id"], account.State["bot_union_id"]),
+	}
+}
+
+func larkBotIdentityFromAccountState(account sdk.ChannelAccount, accountState *state.AccountState) larkBotIdentity {
+	if accountState == nil {
+		return larkBotIdentityFromAccount(account)
+	}
+	return larkBotIdentity{
+		OpenID:  firstString(account.Credential["bot_open_id"], accountState.BotOpenID, account.State["bot_open_id"]),
+		UserID:  firstString(account.Credential["bot_user_id"], accountState.BotUserID, account.State["bot_user_id"]),
+		UnionID: firstString(account.Credential["bot_union_id"], accountState.BotUnionID, account.State["bot_union_id"]),
+	}
+}
+
+func larkSenderID(id lark.SenderID) string {
+	return firstString(id.OpenID, id.UserID, id.UnionID)
+}
+
+func larkSenderMatchesBot(id lark.SenderID, bot larkBotIdentity) bool {
+	return (bot.OpenID != "" && strings.TrimSpace(id.OpenID) == bot.OpenID) ||
+		(bot.UserID != "" && strings.TrimSpace(id.UserID) == bot.UserID) ||
+		(bot.UnionID != "" && strings.TrimSpace(id.UnionID) == bot.UnionID)
+}
+
+func larkMentionMatchesBot(mention lark.Mention, bot larkBotIdentity) bool {
+	return (bot.OpenID != "" && strings.TrimSpace(mention.ID.OpenID) == bot.OpenID) ||
+		(bot.UserID != "" && strings.TrimSpace(mention.ID.UserID) == bot.UserID) ||
+		(bot.UnionID != "" && strings.TrimSpace(mention.ID.UnionID) == bot.UnionID)
+}
+
+func larkMentionsBot(mentions []sdk.MentionIdentity, bot larkBotIdentity) bool {
+	for _, mention := range mentions {
+		id := strings.TrimSpace(mention.ID)
+		switch strings.TrimSpace(mention.IDType) {
+		case "open_id", "":
+			if bot.OpenID != "" && id == bot.OpenID {
+				return true
+			}
+		case "user_id":
+			if bot.UserID != "" && id == bot.UserID {
+				return true
+			}
+		case "union_id":
+			if bot.UnionID != "" && id == bot.UnionID {
+				return true
+			}
+		case "mention_all":
+			return true
+		default:
+			continue
 		}
 	}
 	return false
@@ -532,11 +639,179 @@ func outboundContent(req sdk.OutboundMessage, msgType string) (string, error) {
 	if msgType != "text" {
 		return "", fmt.Errorf("lark outbound content is required for msg_type=%s", msgType)
 	}
-	data, err := json.Marshal(map[string]string{"text": req.Text})
+	data, err := json.Marshal(map[string]string{"text": larkOutboundMentionText(req)})
 	if err != nil {
 		return "", err
 	}
 	return string(data), nil
+}
+
+func larkOutboundMentionText(req sdk.OutboundMessage) string {
+	text := strings.TrimSpace(req.Text)
+	var tags []string
+	if req.MentionAll || boolValue(req.Raw["mention_all"]) || boolValue(req.Raw["mentionAll"]) ||
+		boolValue(req.Raw["at_all"]) || boolValue(req.Raw["atAll"]) || boolValue(req.Raw["isAtAll"]) {
+		tags = append(tags, `<at user_id="all">Everyone</at>`)
+	}
+	for _, id := range stringSlice(firstValue(req.Raw["mention_ids"], req.Raw["mentionIds"], req.Raw["at_user_ids"], req.Raw["atUserIds"], req.Raw["user_ids"], req.Raw["userIds"])) {
+		tags = append(tags, fmt.Sprintf(`<at user_id="%s">%s</at>`, escapeLarkAtText(id), escapeLarkAtText(id)))
+	}
+	mentions := append([]sdk.MentionIdentity{}, req.Mentions...)
+	mentions = append(mentions, rawMentionIdentities(req.Raw["mentions"])...)
+	for _, mention := range mentions {
+		id := strings.TrimSpace(mention.ID)
+		if id == "" {
+			continue
+		}
+		if strings.EqualFold(id, "all") || strings.EqualFold(strings.TrimSpace(mention.IDType), "all") ||
+			strings.EqualFold(strings.TrimSpace(mention.IDType), "mention_all") {
+			tags = append(tags, `<at user_id="all">Everyone</at>`)
+			continue
+		}
+		name := strings.TrimSpace(mention.DisplayName)
+		if name == "" {
+			name = id
+		}
+		tags = append(tags, fmt.Sprintf(`<at user_id="%s">%s</at>`, escapeLarkAtText(id), escapeLarkAtText(name)))
+	}
+	tags = uniqueStrings(tags)
+	if len(tags) == 0 {
+		return text
+	}
+	prefix := strings.Join(tags, " ")
+	if text == "" {
+		return prefix
+	}
+	return prefix + "\n" + text
+}
+
+func escapeLarkAtText(value string) string {
+	value = strings.ReplaceAll(value, "&", "&amp;")
+	value = strings.ReplaceAll(value, `"`, "&quot;")
+	value = strings.ReplaceAll(value, "<", "&lt;")
+	value = strings.ReplaceAll(value, ">", "&gt;")
+	return value
+}
+
+func rawMentionIdentities(value any) []sdk.MentionIdentity {
+	switch typed := value.(type) {
+	case []sdk.MentionIdentity:
+		return typed
+	case []any:
+		out := make([]sdk.MentionIdentity, 0, len(typed))
+		for _, item := range typed {
+			out = append(out, mentionIdentityFromAny(item))
+		}
+		return out
+	case []map[string]any:
+		out := make([]sdk.MentionIdentity, 0, len(typed))
+		for _, item := range typed {
+			out = append(out, mentionIdentityFromAny(item))
+		}
+		return out
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return nil
+		}
+		var parsed []map[string]any
+		if err := json.Unmarshal([]byte(typed), &parsed); err == nil {
+			out := make([]sdk.MentionIdentity, 0, len(parsed))
+			for _, item := range parsed {
+				out = append(out, mentionIdentityFromAny(item))
+			}
+			return out
+		}
+	case json.RawMessage:
+		var parsed []map[string]any
+		if err := json.Unmarshal(typed, &parsed); err == nil {
+			out := make([]sdk.MentionIdentity, 0, len(parsed))
+			for _, item := range parsed {
+				out = append(out, mentionIdentityFromAny(item))
+			}
+			return out
+		}
+	}
+	return nil
+}
+
+func mentionIdentityFromAny(value any) sdk.MentionIdentity {
+	mention, ok := value.(sdk.MentionIdentity)
+	if ok {
+		return mention
+	}
+	item, ok := value.(map[string]any)
+	if !ok {
+		return sdk.MentionIdentity{}
+	}
+	return sdk.MentionIdentity{
+		ID:          firstString(item["id"], item["ID"], item["open_id"], item["openId"], item["user_id"], item["userId"], item["union_id"], item["unionId"]),
+		IDType:      firstString(item["id_type"], item["idType"], item["IDType"], item["type"]),
+		DisplayName: firstString(item["display_name"], item["displayName"], item["name"]),
+	}
+}
+
+func stringSlice(value any) []string {
+	var values []any
+	switch typed := value.(type) {
+	case []string:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if item = strings.TrimSpace(item); item != "" {
+				out = append(out, item)
+			}
+		}
+		return out
+	case []any:
+		values = typed
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return nil
+		}
+		var parsed []any
+		if err := json.Unmarshal([]byte(typed), &parsed); err == nil {
+			values = parsed
+			break
+		}
+		return []string{strings.TrimSpace(typed)}
+	case json.RawMessage:
+		var parsed []any
+		if err := json.Unmarshal(typed, &parsed); err == nil {
+			values = parsed
+		}
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if item := strings.TrimSpace(stringValue(value)); item != "" {
+			out = append(out, item)
+		}
+	}
+	return uniqueStrings(out)
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func firstValue(values ...any) any {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
 }
 
 func optionalBool(value any) *bool {
@@ -574,19 +849,60 @@ func (s *connectorStateStore) seed(account sdk.ChannelAccount) {
 	s.sdkAccounts[accountID] = account
 }
 
-func (s *connectorStateStore) LoadAccount(accountID string) (*state.AccountState, error) {
+func (s *connectorStateStore) LoadAccount(ctx context.Context, accountID string) (*state.AccountState, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if account, ok := s.accounts[accountID]; ok {
+		sdkAccount := s.sdkAccounts[accountID]
+		accountStore := s.accountStore
+		s.mu.Unlock()
+		if refreshed, ok, err := loadAccountState(ctx, accountStore, sdkAccount); err != nil {
+			return nil, err
+		} else if ok {
+			s.mu.Lock()
+			s.accounts[accountID] = refreshed
+			sdkAccount.State = accountStateToSDK(*refreshed, sdkAccount).State
+			s.sdkAccounts[accountID] = sdkAccount
+			s.mu.Unlock()
+			return refreshed, nil
+		}
 		return account, nil
+	}
+	accountStore := s.accountStore
+	s.mu.Unlock()
+	if refreshed, ok, err := loadAccountState(ctx, accountStore, sdk.ChannelAccount{UUID: accountID}); err != nil {
+		return nil, err
+	} else if ok {
+		s.mu.Lock()
+		s.accounts[accountID] = refreshed
+		s.sdkAccounts[accountID] = accountStateToSDK(*refreshed, sdk.ChannelAccount{UUID: accountID})
+		s.mu.Unlock()
+		return refreshed, nil
 	}
 	account := &state.AccountState{AccountID: accountID}
 	account.EnsureMaps()
+	s.mu.Lock()
 	s.accounts[accountID] = account
+	s.mu.Unlock()
 	return account, nil
 }
 
-func (s *connectorStateStore) SaveAccount(account *state.AccountState) error {
+func loadAccountState(ctx context.Context, accountStore sdk.AccountStore, account sdk.ChannelAccount) (*state.AccountState, bool, error) {
+	if accountStore == nil || strings.TrimSpace(account.UUID) == "" {
+		return nil, false, nil
+	}
+	stateMap, err := accountStore.LoadChannelAccountState(ctx, account.UUID)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(stateMap) == 0 {
+		return nil, false, nil
+	}
+	account.State = stateMap
+	refreshed := sdkAccountToState(account)
+	return &refreshed, true, nil
+}
+
+func (s *connectorStateStore) SaveAccount(ctx context.Context, account *state.AccountState) error {
 	if err := state.TouchAccount(account); err != nil {
 		return err
 	}
@@ -598,7 +914,7 @@ func (s *connectorStateStore) SaveAccount(account *state.AccountState) error {
 	accountStore := s.accountStore
 	s.mu.Unlock()
 	if accountStore != nil && sdkAccount.UUID != "" {
-		return accountStore.SaveChannelAccountState(context.Background(), sdkAccount.UUID, sdkAccount.State)
+		return accountStore.SaveChannelAccountState(ctx, sdkAccount.UUID, sdkAccount.State)
 	}
 	return nil
 }
@@ -612,6 +928,8 @@ func sdkAccountToState(account sdk.ChannelAccount) state.AccountState {
 		TenantAccessToken:  stringValue(account.State["tenant_access_token"]),
 		TokenExpiresAt:     timeValue(account.State["tenant_access_token_expires_at"]),
 		BotOpenID:          firstString(account.Credential["bot_open_id"], account.State["bot_open_id"]),
+		BotUserID:          firstString(account.Credential["bot_user_id"], account.State["bot_user_id"]),
+		BotUnionID:         firstString(account.Credential["bot_union_id"], account.State["bot_union_id"]),
 		ChannelLinkSession: stringValue(account.State["channel_link_session"]),
 		PeerSessions:       stringMap(account.State["peer_sessions"]),
 		InboundSeen:        stringMap(account.State["inbound_seen"]),
@@ -639,6 +957,8 @@ func accountStateToSDK(account state.AccountState, existing sdk.ChannelAccount) 
 		"tenant_access_token":            account.TenantAccessToken,
 		"tenant_access_token_expires_at": account.TokenExpiresAt,
 		"bot_open_id":                    account.BotOpenID,
+		"bot_user_id":                    account.BotUserID,
+		"bot_union_id":                   account.BotUnionID,
 		"updated_at":                     account.UpdatedAt,
 	}
 	return existing
