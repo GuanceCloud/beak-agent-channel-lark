@@ -229,16 +229,195 @@ func (m EventMessage) Text() string {
 }
 
 func (m EventMessage) TextWithMentionFilter(strip func(Mention) bool) string {
-	if m.MessageType != "" && m.MessageType != "text" {
+	messageType := strings.TrimSpace(m.MessageType)
+	if messageType == "" || messageType == "text" {
+		var parsed struct {
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal([]byte(m.Content), &parsed); err == nil && parsed.Text != "" {
+			return normalizeText(resolveMentionPlaceholders(parsed.Text, m.Mentions, strip))
+		}
+		return normalizeText(resolveMentionPlaceholders(m.Content, m.Mentions, strip))
+	}
+	if messageType == "post" {
+		return normalizeText(resolveMentionPlaceholders(postContentText(m.Content, m.Mentions, strip), m.Mentions, strip))
+	}
+	return ""
+}
+
+func postContentText(raw string, mentions []Mention, strip func(Mention) bool) string {
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
 		return ""
 	}
-	var parsed struct {
-		Text string `json:"text"`
+	body := unwrapPostLocale(parsed)
+	if body == nil {
+		return ""
 	}
-	if err := json.Unmarshal([]byte(m.Content), &parsed); err == nil && parsed.Text != "" {
-		return normalizeText(resolveMentionPlaceholders(parsed.Text, m.Mentions, strip))
+	var lines []string
+	if title := strings.TrimSpace(anyString(body["title"])); title != "" {
+		lines = append(lines, "**"+title+"**", "")
 	}
-	return normalizeText(resolveMentionPlaceholders(m.Content, m.Mentions, strip))
+	for _, paragraph := range anySlice(body["content"]) {
+		var line strings.Builder
+		for _, item := range anySlice(paragraph) {
+			line.WriteString(renderPostElement(item, mentions, strip))
+		}
+		lines = append(lines, strings.TrimSpace(line.String()))
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func unwrapPostLocale(parsed map[string]any) map[string]any {
+	if _, ok := parsed["content"]; ok {
+		return parsed
+	}
+	if _, ok := parsed["title"]; ok {
+		return parsed
+	}
+	for _, locale := range []string{"zh_cn", "en_us", "ja_jp"} {
+		if body, ok := parsed[locale].(map[string]any); ok {
+			return body
+		}
+	}
+	for _, value := range parsed {
+		if body, ok := value.(map[string]any); ok {
+			return body
+		}
+	}
+	return nil
+}
+
+func renderPostElement(value any, mentions []Mention, strip func(Mention) bool) string {
+	el, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	switch anyString(el["tag"]) {
+	case "text":
+		return applyPostStyle(anyString(el["text"]), anyStringSlice(el["style"]))
+	case "md", "markdown", "lark_md":
+		return anyString(firstNonEmptyAny(el["text"], el["content"]))
+	case "a":
+		text := anyString(el["text"])
+		href := anyString(el["href"])
+		if text == "" {
+			text = href
+		}
+		if href == "" {
+			return text
+		}
+		return "[" + text + "](" + href + ")"
+	case "at":
+		userID := anyString(el["user_id"])
+		if strings.EqualFold(userID, "all") {
+			return "@all"
+		}
+		name := anyString(el["user_name"])
+		if mention, ok := mentionByOpenID(mentions, userID); ok {
+			if strip != nil && strip(mention) {
+				return ""
+			}
+			if mention.Key != "" {
+				return mention.Key
+			}
+			if strings.TrimSpace(mention.Name) != "" {
+				name = mention.Name
+			}
+		}
+		if name == "" {
+			name = userID
+		}
+		if name == "" {
+			return ""
+		}
+		return "@" + strings.TrimPrefix(name, "@")
+	case "img":
+		if key := anyString(el["image_key"]); key != "" {
+			return "![image](" + key + ")"
+		}
+		return ""
+	case "media":
+		if key := anyString(el["file_key"]); key != "" {
+			return `<file key="` + key + `"/>`
+		}
+		return ""
+	case "code_block":
+		lang := anyString(el["language"])
+		code := anyString(el["text"])
+		return "\n```" + lang + "\n" + code + "\n```\n"
+	case "hr":
+		return "\n---\n"
+	default:
+		return anyString(firstNonEmptyAny(el["text"], el["content"]))
+	}
+}
+
+func applyPostStyle(text string, style []string) string {
+	for _, item := range style {
+		switch item {
+		case "bold":
+			text = "**" + text + "**"
+		case "italic":
+			text = "*" + text + "*"
+		case "underline":
+			text = "<u>" + text + "</u>"
+		case "lineThrough":
+			text = "~~" + text + "~~"
+		case "codeInline":
+			text = "`" + text + "`"
+		}
+	}
+	return text
+}
+
+func mentionByOpenID(mentions []Mention, openID string) (Mention, bool) {
+	openID = strings.TrimSpace(openID)
+	if openID == "" {
+		return Mention{}, false
+	}
+	for _, mention := range mentions {
+		if strings.TrimSpace(mention.ID.OpenID) == openID {
+			return mention, true
+		}
+	}
+	return Mention{}, false
+}
+
+func anyString(value any) string {
+	text, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return text
+}
+
+func anySlice(value any) []any {
+	items, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	return items
+}
+
+func anyStringSlice(value any) []string {
+	items := anySlice(value)
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if text := strings.TrimSpace(anyString(item)); text != "" {
+			out = append(out, text)
+		}
+	}
+	return out
+}
+
+func firstNonEmptyAny(values ...any) any {
+	for _, value := range values {
+		if strings.TrimSpace(anyString(value)) != "" {
+			return value
+		}
+	}
+	return nil
 }
 
 func (m EventMessage) ChatIdentity(senderOpenID string) ChatIdentity {

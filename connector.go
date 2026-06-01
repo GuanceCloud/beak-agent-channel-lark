@@ -691,7 +691,13 @@ func receiveIDType(req sdk.OutboundMessage) string {
 
 func outboundMsgType(req sdk.OutboundMessage) string {
 	if value := strings.TrimSpace(stringValue(req.Raw["msg_type"])); value != "" {
+		if strings.EqualFold(value, "markdown") || strings.EqualFold(value, "md") {
+			return "post"
+		}
 		return value
+	}
+	if isMarkdownOutbound(req) {
+		return "post"
 	}
 	return "text"
 }
@@ -711,6 +717,9 @@ func outboundContent(req sdk.OutboundMessage, msgType string) (string, error) {
 			return string(data), nil
 		}
 	}
+	if msgType == "post" && isMarkdownOutbound(req) {
+		return larkMarkdownPostContent(req)
+	}
 	if msgType != "text" {
 		return "", fmt.Errorf("lark outbound content is required for msg_type=%s", msgType)
 	}
@@ -719,6 +728,68 @@ func outboundContent(req sdk.OutboundMessage, msgType string) (string, error) {
 		return "", err
 	}
 	return string(data), nil
+}
+
+func isMarkdownOutbound(req sdk.OutboundMessage) bool {
+	format := strings.ToLower(strings.TrimSpace(firstString(
+		req.Format,
+		req.Raw["format"],
+		req.Raw["content_type"],
+		req.Raw["content_format"],
+		req.Raw["contentType"],
+		req.Raw["contentFormat"],
+		req.Raw["message_format"],
+		req.Raw["messageFormat"],
+		req.Raw["msg_format"],
+		req.Raw["msgFormat"],
+		req.Raw["msg_type"],
+		req.Raw["msgType"],
+	)))
+	return format == "markdown" || format == "md" || format == "text/markdown" || format == "application/markdown"
+}
+
+func larkMarkdownPostContent(req sdk.OutboundMessage) (string, error) {
+	text := larkOutboundMentionText(req)
+	if strings.TrimSpace(text) == "" {
+		return "", fmt.Errorf("text is required")
+	}
+	data, err := json.Marshal(map[string]any{
+		"zh_cn": map[string]any{
+			"title": larkOutboundTitle(req),
+			"content": [][]map[string]string{
+				{{"tag": "md", "text": text}},
+			},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func larkOutboundTitle(req sdk.OutboundMessage) string {
+	if title := strings.TrimSpace(firstString(req.Title, req.Raw["title"])); title != "" {
+		return title
+	}
+	return titleFromMarkdown(req.Text)
+}
+
+func titleFromMarkdown(text string) string {
+	for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		line = strings.TrimSpace(strings.TrimLeft(line, "#*>- \t"))
+		if line == "" {
+			continue
+		}
+		if len([]rune(line)) > 20 {
+			return string([]rune(line)[:20])
+		}
+		return line
+	}
+	return "Message"
 }
 
 func larkOutboundMentionText(req sdk.OutboundMessage) string {

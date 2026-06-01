@@ -11,8 +11,8 @@ This repository is importable library code. It is not a CLI, does not read user-
 - Generic `sdk.Connector` implementation exposed by `beaklark.NewConnector()`.
 - Credential-based Lark/Feishu bot account setup.
 - Host-backed credential and state persistence.
-- Text-only inbound `im.message.receive_v1` WebSocket events to Beak sessions.
-- Text Beak agent output back to Lark/Feishu through `im/v1/messages`.
+- Text and `post` rich-text inbound `im.message.receive_v1` WebSocket events to Beak sessions.
+- Text or markdown-rendered Beak agent output back to Lark/Feishu through `im/v1/messages`.
 - Raw outbound `msg_type`/`content` delivery for host-mapped Lark message types.
 - Optional reply delivery through `im/v1/messages/{message_id}/reply`.
 - Optional encrypted HTTP callback body decryption and request signature verification when `encrypt_key` is configured.
@@ -128,7 +128,7 @@ if err != nil {
 
 `HandleEvent` supports:
 
-- SDK-flattened WebSocket `im.message.receive_v1` text events.
+- SDK-flattened WebSocket `im.message.receive_v1` text and `post` events.
 - Already-decoded events from the host WebSocket runtime. The host's Lark `EventDispatcher` owns transport verification for this path.
 - Self-echo filtering when `bot_open_id` exists.
 - Standard `mentions` extraction and `mentioned_me` detection with `bot_open_id`.
@@ -138,7 +138,7 @@ if err != nil {
 
 For an HTTP callback endpoint, call `HandleWebhookRequest` so the SDK verifies signature headers, timestamp freshness, decrypts the body when needed, and checks `verification_token` when configured. `HandleWebhook` is only for host-owned paths that have already verified and decrypted the request. That path is compatibility support; the OpenClaw reference runtime is WebSocket-first.
 
-## Sending Text
+## Sending Text and Markdown
 
 Gateway can send agent output back through `connector.Send`:
 
@@ -148,6 +148,8 @@ _, err := connector.Send(ctx, runtime, sdk.OutboundMessage{
 	ChatType:    sdk.ChatTypeGroup,
 	ChatID:      "oc_xxx",
 	Text:        "reply text",
+	Format:      "markdown", // optional common field
+	Title:       "Reply",    // optional common markdown title
 	MessageUUID: messageUUID,
 })
 ```
@@ -158,7 +160,7 @@ The SDK obtains and caches a tenant access token in host-owned account state wit
 POST /open-apis/auth/v3/tenant_access_token/internal
 ```
 
-Then sends text with:
+Then sends text or markdown-formatted `post` messages with:
 
 ```text
 POST /open-apis/im/v1/messages?receive_id_type=<chat_id|open_id|union_id>
@@ -166,7 +168,9 @@ POST /open-apis/im/v1/messages?receive_id_type=<chat_id|open_id|union_id>
 
 For group chats, `receive_id_type=chat_id`. For direct chats, the SDK infers the receive id type from `ChatID`, usually `chat_id` for `oc_...` or `open_id` for `ou_...`.
 
-For non-text payloads mapped by Beak host, set `Raw["msg_type"]` and `Raw["content"]`. For replies, set `Raw["reply_to_message_id"]`; optionally set `Raw["reply_in_thread"]`.
+Set `OutboundMessage.Format="markdown"` to render agent output as a Feishu/Lark `post` message with an `md` element. `OutboundMessage.Title` is used as the post title; when omitted, the SDK derives a short title from the first non-empty markdown line.
+
+For normal agent text or markdown, Beak host should pass the same `Text` / `Format` / `Title` fields it passes to the other SDKs and let this SDK map markdown to Lark `post`. `Raw["msg_type"]` and `Raw["content"]` are only for already platform-native Lark payloads. For replies, set `Raw["reply_to_message_id"]`; optionally set `Raw["reply_in_thread"]`.
 
 ## Session Rules
 

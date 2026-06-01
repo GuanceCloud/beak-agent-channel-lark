@@ -575,6 +575,131 @@ func TestLarkConnectorSendUsesRequestedAccount(t *testing.T) {
 	}
 }
 
+func TestLarkConnectorSendMarkdownFormat(t *testing.T) {
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "token-1", "expire": 7200})
+		case "/open-apis/im/v1/messages":
+			var body struct {
+				ReceiveID string `json:"receive_id"`
+				MsgType   string `json:"msg_type"`
+				Content   string `json:"content"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body.ReceiveID != "oc_group" || body.MsgType != "post" {
+				t.Fatalf("send body=%+v", body)
+			}
+			var content struct {
+				ZhCN struct {
+					Title   string `json:"title"`
+					Content [][]struct {
+						Tag  string `json:"tag"`
+						Text string `json:"text"`
+					} `json:"content"`
+				} `json:"zh_cn"`
+			}
+			if err := json.Unmarshal([]byte(body.Content), &content); err != nil {
+				t.Fatal(err)
+			}
+			if content.ZhCN.Title != "日志查询" || len(content.ZhCN.Content) != 1 || len(content.ZhCN.Content[0]) != 1 {
+				t.Fatalf("content=%+v", content)
+			}
+			item := content.ZhCN.Content[0][0]
+			if item.Tag != "md" || item.Text != "# 日志查询\n- 错误日志" {
+				t.Fatalf("markdown item=%+v", item)
+			}
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"message_id": "om_markdown", "chat_id": "oc_group"}})
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+		}
+		return nil, nil
+	})}
+
+	result, err := NewConnector().Send(context.Background(), sdk.Runtime{
+		HTTPClient: httpClient,
+		Account:    sdkAccount("account-1", "cli_1", "secret_1", "https://open.feishu.test"),
+	}, sdk.OutboundMessage{
+		AccountUUID: "account-1",
+		ChatType:    sdk.ChatTypeGroup,
+		ChatID:      "oc_group",
+		Text:        "# 日志查询\n- 错误日志",
+		Format:      "markdown",
+		Title:       "日志查询",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.MessageID != "om_markdown" || result.Raw["msg_type"] != "post" {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestLarkOutboundMarkdownFormatAliases(t *testing.T) {
+	req := sdk.OutboundMessage{Raw: map[string]any{"content_type": "text/markdown"}}
+	if !isMarkdownOutbound(req) {
+		t.Fatalf("isMarkdownOutbound() = false, want true for text/markdown")
+	}
+}
+
+func TestLarkConnectorSendMarkdownTitleIgnoresMentionPrefix(t *testing.T) {
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "token-1", "expire": 7200})
+		case "/open-apis/im/v1/messages":
+			var body struct {
+				MsgType string `json:"msg_type"`
+				Content string `json:"content"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body.MsgType != "post" {
+				t.Fatalf("send body=%+v", body)
+			}
+			var content struct {
+				ZhCN struct {
+					Title   string `json:"title"`
+					Content [][]struct {
+						Text string `json:"text"`
+					} `json:"content"`
+				} `json:"zh_cn"`
+			}
+			if err := json.Unmarshal([]byte(body.Content), &content); err != nil {
+				t.Fatal(err)
+			}
+			if content.ZhCN.Title != "日志查询" {
+				t.Fatalf("title=%q", content.ZhCN.Title)
+			}
+			if got := content.ZhCN.Content[0][0].Text; !strings.HasPrefix(got, `<at user_id="all">Everyone</at>`) {
+				t.Fatalf("markdown text=%q", got)
+			}
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"message_id": "om_markdown", "chat_id": "oc_group"}})
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+		}
+		return nil, nil
+	})}
+
+	_, err := NewConnector().Send(context.Background(), sdk.Runtime{
+		HTTPClient: httpClient,
+		Account:    sdkAccount("account-1", "cli_1", "secret_1", "https://open.feishu.test"),
+	}, sdk.OutboundMessage{
+		AccountUUID: "account-1",
+		ChatType:    sdk.ChatTypeGroup,
+		ChatID:      "oc_group",
+		Text:        "# 日志查询\n- 错误日志",
+		Format:      "markdown",
+		MentionAll:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLarkConnectorSendPersistsTokenForEmptyState(t *testing.T) {
 	var tokenCalls int
 	httpClient := &http.Client{Transport: testRoundTripFunc(func(r *http.Request) (*http.Response, error) {
