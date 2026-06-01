@@ -147,12 +147,58 @@ func TestLarkConnectorWebhookRequestVerifiesSignature(t *testing.T) {
 	req.Header.Set("X-Lark-Request-Nonce", "nonce-1")
 	signature := sha256.Sum256([]byte("1770000000" + "nonce-1" + "encrypt-key" + string(body)))
 	req.Header.Set("X-Lark-Signature", fmt.Sprintf("%x", signature[:]))
-	result, err := connector.HandleWebhookRequest(context.Background(), sdk.Runtime{}, account, req)
+	response, err := connector.HandleWebhookRequest(context.Background(), sdk.Runtime{}, account, req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Challenge != "challenge-1" {
-		t.Fatalf("result=%+v", result)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", response.StatusCode)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(response.Body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["challenge"] != "challenge-1" || len(payload) != 1 {
+		t.Fatalf("payload=%+v", payload)
+	}
+}
+
+func TestLarkConnectorWebhookRequestReturnsSuccessAck(t *testing.T) {
+	connector := newTestWebhookRequestConnector(t)
+	gateway := &fakeSDKGateway{}
+	store := newFakeSDKAccountStore()
+	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	body := []byte(`{
+		"schema":"2.0",
+		"header":{"event_id":"evt_ack","event_type":"im.message.receive_v1","app_id":"cli_1","token":"verify-token"},
+		"event":{
+			"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
+			"message":{"message_id":"om_ack","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"hello\"}","create_time":"1770000000000"}
+		}
+	}`)
+	req, err := http.NewRequest(http.MethodPost, "https://beak.test/webhook", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := connector.HandleWebhookRequest(context.Background(), sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+		AccountStore:  store,
+	}, account, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", response.StatusCode)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(response.Body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["msg"] != "success" || len(payload) != 1 {
+		t.Fatalf("payload=%+v", payload)
 	}
 }
 

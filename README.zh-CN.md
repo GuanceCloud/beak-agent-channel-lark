@@ -78,12 +78,12 @@ type WebhookConnector interface {
 
 ```go
 type WebhookRequestConnector interface {
-	WebhookConnector
-	HandleWebhookRequest(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, req *http.Request) (*beaklark.WebhookResult, error)
+	sdk.Connector
+	HandleWebhookRequest(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, req *http.Request) (*sdk.WebhookResponse, error)
 }
 ```
 
-OpenClaw 对齐的 WebSocket 主链路应 type assert `EventConnector`。只有 host 暴露 HTTP callback endpoint 时，才使用 `WebhookRequestConnector`。
+OpenClaw 对齐的 WebSocket 主链路应 type assert `EventConnector`。只有 host 暴露 HTTP callback endpoint 时，才使用 `WebhookRequestConnector`；该路径返回平台 HTTP response，不返回 Beak 内部消息元数据。
 
 ## Credential Schema
 

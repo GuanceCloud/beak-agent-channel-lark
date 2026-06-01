@@ -68,12 +68,12 @@ For raw `*http.Request` handling with signature verification, the connector also
 
 ```go
 type WebhookRequestConnector interface {
-	WebhookConnector
-	HandleWebhookRequest(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, req *http.Request) (*beaklark.WebhookResult, error)
+	sdk.Connector
+	HandleWebhookRequest(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, req *http.Request) (*sdk.WebhookResponse, error)
 }
 ```
 
-Beak host should use `EventConnector` for the OpenClaw-aligned WebSocket path. Use `WebhookRequestConnector` only when the host exposes an HTTP callback endpoint.
+Beak host should use `EventConnector` for the OpenClaw-aligned WebSocket path. Use `WebhookRequestConnector` only when the host exposes an HTTP callback endpoint; that path returns the platform HTTP response, not Beak internal message metadata.
 
 ## Credential Schema
 

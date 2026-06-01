@@ -45,8 +45,8 @@ type EventConnector interface {
 }
 
 type WebhookRequestConnector interface {
-	WebhookConnector
-	HandleWebhookRequest(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, req *http.Request) (*WebhookResult, error)
+	sdk.Connector
+	HandleWebhookRequest(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, req *http.Request) (*sdk.WebhookResponse, error)
 }
 
 func NewConnector() sdk.Connector {
@@ -250,7 +250,7 @@ func (c Connector) HandleEvent(ctx context.Context, runtime sdk.Runtime, account
 	return c.processMessageEvent(ctx, runtime, account, hook, false)
 }
 
-func (c Connector) HandleWebhookRequest(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, req *http.Request) (*WebhookResult, error) {
+func (c Connector) HandleWebhookRequest(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, req *http.Request) (*sdk.WebhookResponse, error) {
 	if req == nil || req.Body == nil {
 		return nil, fmt.Errorf("lark webhook request body is required")
 	}
@@ -270,7 +270,30 @@ func (c Connector) HandleWebhookRequest(ctx context.Context, runtime sdk.Runtime
 			return nil, fmt.Errorf("lark webhook signature mismatch")
 		}
 	}
-	return c.HandleWebhook(ctx, runtime, account, body)
+	result, err := c.HandleWebhook(ctx, runtime, account, body)
+	if err != nil {
+		return nil, err
+	}
+	return larkWebhookResponse(result)
+}
+
+func larkWebhookResponse(result *WebhookResult) (*sdk.WebhookResponse, error) {
+	if result != nil && strings.TrimSpace(result.Type) == "url_verification" && strings.TrimSpace(result.Challenge) != "" {
+		return jsonWebhookResponse(map[string]string{"challenge": result.Challenge})
+	}
+	return jsonWebhookResponse(map[string]string{"msg": "success"})
+}
+
+func jsonWebhookResponse(value any) (*sdk.WebhookResponse, error) {
+	body, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	return &sdk.WebhookResponse{
+		StatusCode: http.StatusOK,
+		Headers:    map[string]string{"content-type": "application/json; charset=utf-8"},
+		Body:       body,
+	}, nil
 }
 
 func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, hook *lark.Webhook, verifyToken bool) (*WebhookResult, error) {
