@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/GuanceCloud/beak-agent-channel-lark/sdk"
 )
@@ -53,6 +54,9 @@ func TestLarkConnectorMetadataAndSchema(t *testing.T) {
 	}
 	if !schema.Properties["app_secret"].Secret {
 		t.Fatalf("app_secret should be secret")
+	}
+	if _, ok := schema.Properties["base_url"]; ok {
+		t.Fatalf("base_url must not be exposed in credential schema")
 	}
 }
 
@@ -143,10 +147,7 @@ func TestLarkConnectorWebhookRequestVerifiesSignature(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("X-Lark-Request-Timestamp", "1770000000")
-	req.Header.Set("X-Lark-Request-Nonce", "nonce-1")
-	signature := sha256.Sum256([]byte("1770000000" + "nonce-1" + "encrypt-key" + string(body)))
-	req.Header.Set("X-Lark-Signature", fmt.Sprintf("%x", signature[:]))
+	signLarkWebhookRequest(req, body, "encrypt-key")
 	response, err := connector.HandleWebhookRequest(context.Background(), sdk.Runtime{}, account, req)
 	if err != nil {
 		t.Fatal(err)
@@ -163,11 +164,41 @@ func TestLarkConnectorWebhookRequestVerifiesSignature(t *testing.T) {
 	}
 }
 
+func TestLarkConnectorWebhookRequestRejectsMissingSignature(t *testing.T) {
+	connector := newTestWebhookRequestConnector(t)
+	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	account.Credential["encrypt_key"] = "encrypt-key"
+	body := []byte(`{"type":"url_verification","challenge":"challenge-1","token":"verify-token"}`)
+	req, err := http.NewRequest(http.MethodPost, "https://beak.test/webhook", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connector.HandleWebhookRequest(context.Background(), sdk.Runtime{}, account, req); err == nil || !strings.Contains(err.Error(), "signature headers are required") {
+		t.Fatalf("HandleWebhookRequest() error=%v, want missing signature", err)
+	}
+}
+
+func TestLarkConnectorWebhookRequestRejectsExpiredSignature(t *testing.T) {
+	connector := newTestWebhookRequestConnector(t)
+	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	account.Credential["encrypt_key"] = "encrypt-key"
+	body := []byte(`{"type":"url_verification","challenge":"challenge-1","token":"verify-token"}`)
+	req, err := http.NewRequest(http.MethodPost, "https://beak.test/webhook", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	signLarkWebhookRequestAt(req, body, "encrypt-key", time.Now().UTC().Add(-2*time.Hour))
+	if _, err := connector.HandleWebhookRequest(context.Background(), sdk.Runtime{}, account, req); err == nil || !strings.Contains(err.Error(), "timestamp is expired") {
+		t.Fatalf("HandleWebhookRequest() error=%v, want expired timestamp", err)
+	}
+}
+
 func TestLarkConnectorWebhookRequestReturnsSuccessAck(t *testing.T) {
 	connector := newTestWebhookRequestConnector(t)
 	gateway := &fakeSDKGateway{}
 	store := newFakeSDKAccountStore()
 	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	account.Credential["encrypt_key"] = "encrypt-key"
 	body := []byte(`{
 		"schema":"2.0",
 		"header":{"event_id":"evt_ack","event_type":"im.message.receive_v1","app_id":"cli_1","token":"verify-token"},
@@ -180,6 +211,7 @@ func TestLarkConnectorWebhookRequestReturnsSuccessAck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	signLarkWebhookRequest(req, body, "encrypt-key")
 	response, err := connector.HandleWebhookRequest(context.Background(), sdk.Runtime{
 		WorkspaceUUID: "workspace-1",
 		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
@@ -264,6 +296,9 @@ func TestLarkConnectorWebhookCreatesMessageAndDedupes(t *testing.T) {
 	defer gateway.mu.Unlock()
 	if len(gateway.messages) != 1 {
 		t.Fatalf("duplicate created message=%+v", gateway.messages)
+	}
+	if gateway.messages[0].DedupeKey != "account-1:message:om_1" {
+		t.Fatalf("dedupe key=%q", gateway.messages[0].DedupeKey)
 	}
 }
 
@@ -801,4 +836,17 @@ func encryptWebhookForTest(t *testing.T, plain string, key string) string {
 	copy(out, iv)
 	cipher.NewCBCEncrypter(block, iv).CryptBlocks(out[len(iv):], padded)
 	return base64.StdEncoding.EncodeToString(out)
+}
+
+func signLarkWebhookRequest(req *http.Request, body []byte, encryptKey string) {
+	signLarkWebhookRequestAt(req, body, encryptKey, time.Now().UTC())
+}
+
+func signLarkWebhookRequestAt(req *http.Request, body []byte, encryptKey string, now time.Time) {
+	timestamp := fmt.Sprintf("%d", now.Unix())
+	nonce := "nonce-1"
+	req.Header.Set("X-Lark-Request-Timestamp", timestamp)
+	req.Header.Set("X-Lark-Request-Nonce", nonce)
+	signature := sha256.Sum256([]byte(timestamp + nonce + encryptKey + string(body)))
+	req.Header.Set("X-Lark-Signature", fmt.Sprintf("%x", signature[:]))
 }

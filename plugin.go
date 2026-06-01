@@ -106,11 +106,6 @@ func (Channel) SettingsSchema() SettingsSchema {
 				"title":       "Brand",
 				"description": "feishu or lark. Defaults to feishu.",
 			},
-			"base_url": map[string]any{
-				"type":        "string",
-				"title":       "Open API Base URL",
-				"description": "Optional Open API base URL override.",
-			},
 			"bot_open_id": map[string]any{
 				"type":        "string",
 				"title":       "Bot Open ID",

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -259,22 +260,42 @@ func (c Connector) HandleWebhookRequest(ctx context.Context, runtime sdk.Runtime
 		return nil, err
 	}
 	signature := firstString(req.Header.Get("X-Lark-Signature"), req.Header.Get("X-Lark-Request-Signature"))
-	if signature != "" {
-		encryptKey := stringValue(account.Credential["encrypt_key"])
-		if encryptKey == "" {
-			return nil, fmt.Errorf("lark webhook signature verification requires encrypt_key")
-		}
-		timestamp := firstString(req.Header.Get("X-Lark-Request-Timestamp"), req.Header.Get("X-Lark-Timestamp"))
-		nonce := firstString(req.Header.Get("X-Lark-Request-Nonce"), req.Header.Get("X-Lark-Nonce"))
-		if !lark.VerifyWebhookSignature(timestamp, nonce, encryptKey, body, signature) {
-			return nil, fmt.Errorf("lark webhook signature mismatch")
-		}
+	timestamp := firstString(req.Header.Get("X-Lark-Request-Timestamp"), req.Header.Get("X-Lark-Timestamp"))
+	nonce := firstString(req.Header.Get("X-Lark-Request-Nonce"), req.Header.Get("X-Lark-Nonce"))
+	encryptKey := stringValue(account.Credential["encrypt_key"])
+	if err := verifyLarkWebhookRequestSignature(timestamp, nonce, encryptKey, body, signature, time.Now().UTC()); err != nil {
+		return nil, err
 	}
 	result, err := c.HandleWebhook(ctx, runtime, account, body)
 	if err != nil {
 		return nil, err
 	}
 	return larkWebhookResponse(result)
+}
+
+func verifyLarkWebhookRequestSignature(timestamp, nonce, encryptKey string, body []byte, signature string, now time.Time) error {
+	if strings.TrimSpace(signature) == "" || strings.TrimSpace(timestamp) == "" || strings.TrimSpace(nonce) == "" {
+		return fmt.Errorf("lark webhook signature headers are required")
+	}
+	if strings.TrimSpace(encryptKey) == "" {
+		return fmt.Errorf("lark webhook signature verification requires encrypt_key")
+	}
+	seconds, err := strconv.ParseInt(strings.TrimSpace(timestamp), 10, 64)
+	if err != nil {
+		return fmt.Errorf("lark webhook timestamp is invalid")
+	}
+	sentAt := time.Unix(seconds, 0).UTC()
+	age := now.Sub(sentAt)
+	if age < 0 {
+		age = -age
+	}
+	if age > time.Hour {
+		return fmt.Errorf("lark webhook timestamp is expired")
+	}
+	if !lark.VerifyWebhookSignature(timestamp, nonce, encryptKey, body, signature) {
+		return fmt.Errorf("lark webhook signature mismatch")
+	}
+	return nil
 }
 
 func larkWebhookResponse(result *WebhookResult) (*sdk.WebhookResponse, error) {
@@ -356,6 +377,7 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 		SessionUUID:   sessionUUID,
 		SenderID:      sdk.IMPersonParticipantID(Platform, chat.ChatType, chat.ChatID, chat.SenderID),
 		Content:       text,
+		DedupeKey:     key,
 		Metadata: map[string]any{
 			"source":            Platform,
 			"platform":          Platform,
@@ -618,9 +640,6 @@ func clientFromAccount(runtime sdk.Runtime, account sdk.ChannelAccount) *lark.Cl
 }
 
 func baseURLFromCredential(credential map[string]any) string {
-	if baseURL := strings.TrimSpace(stringValue(credential["base_url"])); baseURL != "" {
-		return baseURL
-	}
 	if strings.EqualFold(strings.TrimSpace(stringValue(credential["brand"])), "lark") {
 		return lark.DefaultLarkBaseURL
 	}

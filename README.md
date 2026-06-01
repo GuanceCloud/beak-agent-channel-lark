@@ -84,7 +84,6 @@ Beak host should use `EventConnector` for the OpenClaw-aligned WebSocket path. U
 - `verification_token`: optional event subscription token.
 - `encrypt_key`: optional event subscription encrypt key. The SDK uses it for encrypted webhook payload decryption and request signature verification.
 - `brand`: optional, `feishu` or `lark`; defaults to `feishu`.
-- `base_url`: optional Open API base URL override.
 - `bot_open_id`: optional bot open id used to drop self echo messages.
 
 Beak host must encrypt credential JSON before persistence. The SDK does not write credential or state to local files.
@@ -137,7 +136,7 @@ if err != nil {
 - Session creation/reuse through `sdk.Gateway.EnsureChatSession`.
 - Beak message creation through `sdk.Gateway.CreateMessage`.
 
-For an HTTP callback endpoint, call `HandleWebhookRequest` to verify request headers or `HandleWebhook` when the host already verified and decrypted the request. The HTTP callback path checks `verification_token` when configured. That path is compatibility support; the OpenClaw reference runtime is WebSocket-first.
+For an HTTP callback endpoint, call `HandleWebhookRequest` so the SDK verifies signature headers, timestamp freshness, decrypts the body when needed, and checks `verification_token` when configured. `HandleWebhook` is only for host-owned paths that have already verified and decrypted the request. That path is compatibility support; the OpenClaw reference runtime is WebSocket-first.
 
 ## Sending Text
 

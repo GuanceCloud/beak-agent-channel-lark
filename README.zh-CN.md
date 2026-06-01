@@ -94,7 +94,6 @@ OpenClaw 对齐的 WebSocket 主链路应 type assert `EventConnector`。只有 
 - `verification_token`：可选，事件订阅 verification token。
 - `encrypt_key`：可选事件订阅 encrypt key。SDK 用它解密加密 webhook payload，并校验请求签名。
 - `brand`：可选，`feishu` 或 `lark`，默认 `feishu`。
-- `base_url`：可选，Open API base URL override。
 - `bot_open_id`：可选，用于过滤 bot 自己发出的 self echo 消息。
 
 Beak host 必须在入库前加密 credential JSON。SDK 不把 credential 或 state 写入本地文件。
@@ -147,7 +146,7 @@ if err != nil {
 - 通过 `sdk.Gateway.EnsureChatSession` 创建或复用 session。
 - 通过 `sdk.Gateway.CreateMessage` 写入 Beak message。
 
-如果 host 使用 HTTP callback endpoint，可以调用 `HandleWebhookRequest` 让 SDK 校验请求 header；如果 host 已经自行验签和解密，可以调用 `HandleWebhook`。HTTP callback 路径会在配置 `verification_token` 时校验 token。这只是兼容入口，OpenClaw 参考实现的主链路是 WebSocket-first。
+如果 host 使用 HTTP callback endpoint，必须调用 `HandleWebhookRequest`，由 SDK 校验签名 header、timestamp 新鲜度，必要时解密 body，并在配置 `verification_token` 时校验 token。`HandleWebhook` 只用于 host 已经自行验签和解密的内部路径。这只是兼容入口，OpenClaw 参考实现的主链路是 WebSocket-first。
 
 ## 发送文本
 
