@@ -135,7 +135,7 @@ func (c Connector) Start(ctx context.Context, runtime sdk.Runtime) error {
 		if err != nil {
 			return err
 		}
-		if _, err := ensureLarkBotIdentity(ctx, runtime, account, state, store); err != nil {
+		if _, err := ensureLarkBotIdentity(ctx, runtime, account, state, store, false); err != nil {
 			return err
 		}
 		if state.ChannelLinkSession != sessionUUID {
@@ -340,7 +340,7 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 	if err != nil {
 		return nil, err
 	}
-	bot, err := ensureLarkBotIdentity(ctx, runtime, account, state, store)
+	bot, err := ensureLarkBotIdentity(ctx, runtime, account, state, store, larkMessageNeedsBotName(hook.Event.Message))
 	if err != nil {
 		return nil, err
 	}
@@ -488,12 +488,26 @@ func larkMentionsAll(mentions []lark.Mention) bool {
 	return false
 }
 
+func larkMessageNeedsBotName(message lark.EventMessage) bool {
+	for _, mention := range message.Mentions {
+		if strings.TrimSpace(mention.Name) == "" || larkMentionIsAll(mention) {
+			continue
+		}
+		if strings.TrimSpace(mention.ID.OpenID) == "" &&
+			(strings.TrimSpace(mention.ID.UserID) != "" || strings.TrimSpace(mention.ID.UnionID) != "") {
+			return true
+		}
+	}
+	return false
+}
+
 func larkMentionIsAll(mention lark.Mention) bool {
 	return strings.TrimSpace(mention.Key) == "@_all"
 }
 
 type larkBotIdentity struct {
 	OpenID  string
+	Name    string
 	UserID  string
 	UnionID string
 }
@@ -513,6 +527,7 @@ func larkEventOwnershipValid(account sdk.ChannelAccount, hook *lark.Webhook) boo
 func larkBotIdentityFromAccount(account sdk.ChannelAccount) larkBotIdentity {
 	return larkBotIdentity{
 		OpenID:  firstString(account.Credential["bot_open_id"], account.State["bot_open_id"]),
+		Name:    firstString(account.Credential["bot_name"], account.Credential["bot_app_name"], account.State["bot_name"], account.State["bot_app_name"]),
 		UserID:  firstString(account.Credential["bot_user_id"], account.State["bot_user_id"]),
 		UnionID: firstString(account.Credential["bot_union_id"], account.State["bot_union_id"]),
 	}
@@ -524,14 +539,15 @@ func larkBotIdentityFromAccountState(account sdk.ChannelAccount, accountState *s
 	}
 	return larkBotIdentity{
 		OpenID:  firstString(account.Credential["bot_open_id"], accountState.BotOpenID, account.State["bot_open_id"]),
+		Name:    firstString(account.Credential["bot_name"], account.Credential["bot_app_name"], accountState.BotName, account.State["bot_name"], account.State["bot_app_name"]),
 		UserID:  firstString(account.Credential["bot_user_id"], accountState.BotUserID, account.State["bot_user_id"]),
 		UnionID: firstString(account.Credential["bot_union_id"], accountState.BotUnionID, account.State["bot_union_id"]),
 	}
 }
 
-func ensureLarkBotIdentity(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, accountState *state.AccountState, store *connectorStateStore) (larkBotIdentity, error) {
+func ensureLarkBotIdentity(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, accountState *state.AccountState, store *connectorStateStore, needName bool) (larkBotIdentity, error) {
 	bot := larkBotIdentityFromAccountState(account, accountState)
-	if bot.OpenID != "" || bot.UserID != "" || bot.UnionID != "" {
+	if bot.UserID != "" || bot.UnionID != "" || (bot.OpenID != "" && (!needName || bot.Name != "")) {
 		return bot, nil
 	}
 	if accountState == nil || store == nil {
@@ -545,11 +561,15 @@ func ensureLarkBotIdentity(ctx context.Context, runtime sdk.Runtime, account sdk
 	}
 	info, err := client.BotInfo(ctx)
 	if err != nil {
+		if bot.OpenID != "" || bot.Name != "" || bot.UserID != "" || bot.UnionID != "" {
+			return bot, nil
+		}
 		return bot, err
 	}
 	accountState.TenantAccessToken = client.TenantToken
 	accountState.TokenExpiresAt = client.TenantTokenExpiresAt
 	accountState.BotOpenID = strings.TrimSpace(info.Bot.OpenID)
+	accountState.BotName = strings.TrimSpace(info.Bot.AppName)
 	if err := store.SaveAccount(ctx, accountState); err != nil {
 		return bot, err
 	}
@@ -568,6 +588,7 @@ func larkSenderMatchesBot(id lark.SenderID, bot larkBotIdentity) bool {
 
 func larkMentionMatchesBot(mention lark.Mention, bot larkBotIdentity) bool {
 	return (bot.OpenID != "" && strings.TrimSpace(mention.ID.OpenID) == bot.OpenID) ||
+		(bot.Name != "" && strings.TrimSpace(mention.Name) == bot.Name) ||
 		(bot.UserID != "" && strings.TrimSpace(mention.ID.UserID) == bot.UserID) ||
 		(bot.UnionID != "" && strings.TrimSpace(mention.ID.UnionID) == bot.UnionID)
 }
@@ -590,8 +611,9 @@ func larkMentionsBot(mentions []sdk.MentionIdentity, bot larkBotIdentity) bool {
 			}
 		case "mention_all":
 			return true
-		default:
-			continue
+		}
+		if bot.Name != "" && strings.TrimSpace(mention.DisplayName) == bot.Name {
+			return true
 		}
 	}
 	return false
@@ -1074,6 +1096,7 @@ func sdkAccountToState(account sdk.ChannelAccount) state.AccountState {
 		TenantAccessToken:  stringValue(account.State["tenant_access_token"]),
 		TokenExpiresAt:     timeValue(account.State["tenant_access_token_expires_at"]),
 		BotOpenID:          firstString(account.Credential["bot_open_id"], account.State["bot_open_id"]),
+		BotName:            firstString(account.Credential["bot_name"], account.Credential["bot_app_name"], account.State["bot_name"], account.State["bot_app_name"]),
 		BotUserID:          firstString(account.Credential["bot_user_id"], account.State["bot_user_id"]),
 		BotUnionID:         firstString(account.Credential["bot_union_id"], account.State["bot_union_id"]),
 		ChannelLinkSession: stringValue(account.State["channel_link_session"]),
@@ -1103,6 +1126,7 @@ func accountStateToSDK(account state.AccountState, existing sdk.ChannelAccount) 
 		"tenant_access_token":            account.TenantAccessToken,
 		"tenant_access_token_expires_at": account.TokenExpiresAt,
 		"bot_open_id":                    account.BotOpenID,
+		"bot_name":                       account.BotName,
 		"bot_user_id":                    account.BotUserID,
 		"bot_union_id":                   account.BotUnionID,
 		"updated_at":                     account.UpdatedAt,

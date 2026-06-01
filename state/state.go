@@ -19,6 +19,7 @@ type AccountState struct {
 	TenantAccessToken  string            `json:"tenant_access_token,omitempty"`
 	TokenExpiresAt     time.Time         `json:"tenant_access_token_expires_at,omitempty"`
 	BotOpenID          string            `json:"bot_open_id,omitempty"`
+	BotName            string            `json:"bot_name,omitempty"`
 	BotUserID          string            `json:"bot_user_id,omitempty"`
 	BotUnionID         string            `json:"bot_union_id,omitempty"`
 	ChannelLinkSession string            `json:"channel_link_session,omitempty"`

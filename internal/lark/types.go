@@ -269,11 +269,23 @@ func postContentText(raw string, mentions []Mention, strip func(Mention) bool) s
 }
 
 func unwrapPostLocale(parsed map[string]any) map[string]any {
+	return unwrapPostLocaleDepth(parsed, 0)
+}
+
+func unwrapPostLocaleDepth(parsed map[string]any, depth int) map[string]any {
+	if parsed == nil || depth > 4 {
+		return nil
+	}
 	if _, ok := parsed["content"]; ok {
 		return parsed
 	}
 	if _, ok := parsed["title"]; ok {
 		return parsed
+	}
+	if post, ok := parsed["post"].(map[string]any); ok {
+		if body := unwrapPostLocaleDepth(post, depth+1); body != nil {
+			return body
+		}
 	}
 	for _, locale := range []string{"zh_cn", "en_us", "ja_jp"} {
 		if body, ok := parsed[locale].(map[string]any); ok {
@@ -282,7 +294,9 @@ func unwrapPostLocale(parsed map[string]any) map[string]any {
 	}
 	for _, value := range parsed {
 		if body, ok := value.(map[string]any); ok {
-			return body
+			if unwrapped := unwrapPostLocaleDepth(body, depth+1); unwrapped != nil {
+				return unwrapped
+			}
 		}
 	}
 	return nil
@@ -314,7 +328,7 @@ func renderPostElement(value any, mentions []Mention, strip func(Mention) bool) 
 			return "@all"
 		}
 		name := anyString(el["user_name"])
-		if mention, ok := mentionByOpenID(mentions, userID); ok {
+		if mention, ok := mentionByID(mentions, userID); ok {
 			if strip != nil && strip(mention) {
 				return ""
 			}
@@ -371,13 +385,15 @@ func applyPostStyle(text string, style []string) string {
 	return text
 }
 
-func mentionByOpenID(mentions []Mention, openID string) (Mention, bool) {
-	openID = strings.TrimSpace(openID)
-	if openID == "" {
+func mentionByID(mentions []Mention, id string) (Mention, bool) {
+	id = strings.TrimSpace(id)
+	if id == "" {
 		return Mention{}, false
 	}
 	for _, mention := range mentions {
-		if strings.TrimSpace(mention.ID.OpenID) == openID {
+		if strings.TrimSpace(mention.ID.OpenID) == id ||
+			strings.TrimSpace(mention.ID.UserID) == id ||
+			strings.TrimSpace(mention.ID.UnionID) == id {
 			return mention, true
 		}
 	}
