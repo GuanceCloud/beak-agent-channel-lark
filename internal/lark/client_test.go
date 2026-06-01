@@ -278,6 +278,42 @@ func TestEventMessageTextResolvesMentionPlaceholders(t *testing.T) {
 	}
 }
 
+func TestEventMessagePostText(t *testing.T) {
+	msg := EventMessage{
+		MessageType: "post",
+		Content: `{
+			"zh_cn":{
+				"title":"日报",
+				"content":[
+					[
+						{"tag":"text","text":"处理","style":["bold"]},
+						{"tag":"a","text":"链接","href":"https://example.test"}
+					],
+					[
+						{"tag":"at","user_id":"ou_bot","user_name":"Bot"},
+						{"tag":"text","text":" 和 "},
+						{"tag":"at","user_id":"ou_user","user_name":"Alice"}
+					],
+					[
+						{"tag":"code_block","language":"go","text":"fmt.Println(1)"}
+					]
+				]
+			}
+		}`,
+		Mentions: []Mention{
+			{Key: "@_bot", ID: SenderID{OpenID: "ou_bot"}, Name: "Bot"},
+			{Key: "@_user", ID: SenderID{OpenID: "ou_user"}, Name: "Alice"},
+		},
+	}
+	got := msg.TextWithMentionFilter(func(mention Mention) bool {
+		return mention.ID.OpenID == "ou_bot"
+	})
+	want := "**日报**\n\n**处理**[链接](https://example.test)\n和 @Alice\n```go\nfmt.Println(1)\n```"
+	if got != want {
+		t.Fatalf("text=%q want=%q", got, want)
+	}
+}
+
 func TestParseURLVerification(t *testing.T) {
 	hook, err := ParseWebhook([]byte(`{"type":"url_verification","challenge":"challenge-1","token":"verify-token"}`))
 	if err != nil {
