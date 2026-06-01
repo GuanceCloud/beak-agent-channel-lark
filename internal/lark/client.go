@@ -75,6 +75,24 @@ func (c *Client) TenantAccessTokenWithExpiry(ctx context.Context, now time.Time)
 	return resp.TenantAccessToken, expiresAt, nil
 }
 
+func (c *Client) BotInfo(ctx context.Context) (*BotInfoResponse, error) {
+	token, err := c.tokenForRequest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var resp BotInfoResponse
+	if err := c.doJSON(ctx, http.MethodGet, "/bot/v3/info", nil, nil, &resp, withBearer(token)); err != nil {
+		return nil, err
+	}
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("bot info failed: code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	if strings.TrimSpace(resp.Bot.OpenID) == "" {
+		return nil, fmt.Errorf("bot info failed: missing open_id")
+	}
+	return &resp, nil
+}
+
 func (c *Client) SendText(ctx context.Context, req SendTextRequest) (*SendTextResponse, error) {
 	if strings.TrimSpace(req.ReceiveID) == "" {
 		return nil, fmt.Errorf("receive_id is required")

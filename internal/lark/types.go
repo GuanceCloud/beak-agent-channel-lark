@@ -24,6 +24,18 @@ type TokenResponse struct {
 	Expire            int    `json:"expire"`
 }
 
+type BotInfoResponse struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Bot  struct {
+		ActivateStatus int      `json:"activate_status"`
+		AppName        string   `json:"app_name"`
+		AvatarURL      string   `json:"avatar_url"`
+		IPWhiteList    []string `json:"ip_white_list"`
+		OpenID         string   `json:"open_id"`
+	} `json:"bot"`
+}
+
 type SendTextRequest struct {
 	ReceiveID     string
 	ReceiveIDType string

@@ -130,6 +130,31 @@ func TestClientTenantTokenWithExpiryCachesToken(t *testing.T) {
 	}
 }
 
+func TestClientBotInfoUsesTenantToken(t *testing.T) {
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/open-apis/bot/v3/info" {
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+		}
+		if r.Method != http.MethodGet {
+			t.Fatalf("bot info method=%s", r.Method)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer cached-token" {
+			t.Fatalf("auth=%q", got)
+		}
+		return jsonResponse(map[string]any{"code": 0, "msg": "ok", "bot": map[string]any{"open_id": "ou_bot_live", "app_name": "Beak Bot"}})
+	})}
+	client := NewClient("https://open.feishu.test", "cli_1", "secret_1")
+	client.HTTPClient = httpClient
+	client.TenantToken = "cached-token"
+	info, err := client.BotInfo(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Bot.OpenID != "ou_bot_live" {
+		t.Fatalf("info=%+v", info)
+	}
+}
+
 func TestClientSendGenericAndReplyMessage(t *testing.T) {
 	var sawSend bool
 	var sawReply bool

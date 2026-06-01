@@ -397,6 +397,57 @@ func TestLarkConnectorHandleEventUsesLoadedBotIdentity(t *testing.T) {
 	}
 }
 
+func TestLarkConnectorHandleEventFetchesBotIdentity(t *testing.T) {
+	connector := newTestEventConnector(t)
+	gateway := &fakeSDKGateway{}
+	store := newFakeSDKAccountStore()
+	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	delete(account.Credential, "bot_open_id")
+	var sawBotInfo bool
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "tenant-token", "expire": 7200})
+		case "/open-apis/bot/v3/info":
+			sawBotInfo = true
+			if got := req.Header.Get("Authorization"); got != "Bearer tenant-token" {
+				t.Fatalf("auth=%q", got)
+			}
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "bot": map[string]any{"open_id": "ou_bot_live", "app_name": "Beak Bot"}})
+		default:
+			t.Fatalf("unexpected request: %s", req.URL.Path)
+			return nil, nil
+		}
+	})}
+	body := []byte(`{
+		"app_id":"cli_1",
+		"event_id":"evt_fetch_bot",
+		"event_type":"im.message.receive_v1",
+		"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
+		"message":{"message_id":"om_fetch_bot","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"@_bot ping\"}","create_time":"1770000000000","mentions":[{"key":"@_bot","id":{"open_id":"ou_bot_live"},"name":"Beak Bot"}]}
+	}`)
+	result, err := connector.HandleEvent(context.Background(), sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+		AccountStore:  store,
+		HTTPClient:    httpClient,
+	}, account, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawBotInfo {
+		t.Fatal("bot info endpoint was not called")
+	}
+	if result.Inbound == nil || !result.Inbound.MentionedMe || result.Inbound.Text != "ping" {
+		t.Fatalf("inbound=%+v", result.Inbound)
+	}
+	if got := store.state("account-1")["bot_open_id"]; got != "ou_bot_live" {
+		t.Fatalf("state bot_open_id=%#v", got)
+	}
+}
+
 func TestLarkConnectorHandleEventRejectsMismatchedAppID(t *testing.T) {
 	connector := newTestEventConnector(t)
 	gateway := &fakeSDKGateway{}

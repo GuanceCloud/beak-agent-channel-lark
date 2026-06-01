@@ -135,6 +135,9 @@ func (c Connector) Start(ctx context.Context, runtime sdk.Runtime) error {
 		if err != nil {
 			return err
 		}
+		if _, err := ensureLarkBotIdentity(ctx, runtime, account, state, store); err != nil {
+			return err
+		}
 		if state.ChannelLinkSession != sessionUUID {
 			state.ChannelLinkSession = sessionUUID
 			if err := store.SaveAccount(ctx, state); err != nil {
@@ -337,7 +340,10 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 	if err != nil {
 		return nil, err
 	}
-	bot := larkBotIdentityFromAccountState(account, state)
+	bot, err := ensureLarkBotIdentity(ctx, runtime, account, state, store)
+	if err != nil {
+		return nil, err
+	}
 	senderID := larkSenderID(hook.Event.Sender.SenderID)
 	if larkSenderMatchesBot(hook.Event.Sender.SenderID, bot) {
 		return &WebhookResult{Type: hook.EventType(), Ignored: true, Reason: "self_echo"}, nil
@@ -521,6 +527,33 @@ func larkBotIdentityFromAccountState(account sdk.ChannelAccount, accountState *s
 		UserID:  firstString(account.Credential["bot_user_id"], accountState.BotUserID, account.State["bot_user_id"]),
 		UnionID: firstString(account.Credential["bot_union_id"], accountState.BotUnionID, account.State["bot_union_id"]),
 	}
+}
+
+func ensureLarkBotIdentity(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, accountState *state.AccountState, store *connectorStateStore) (larkBotIdentity, error) {
+	bot := larkBotIdentityFromAccountState(account, accountState)
+	if bot.OpenID != "" || bot.UserID != "" || bot.UnionID != "" {
+		return bot, nil
+	}
+	if accountState == nil || store == nil {
+		return bot, nil
+	}
+	client := clientFromAccount(runtime, account)
+	now := time.Now().UTC()
+	if accountState.TenantAccessToken != "" && accountState.TokenExpiresAt.After(now.Add(5*time.Minute)) {
+		client.TenantToken = accountState.TenantAccessToken
+		client.TenantTokenExpiresAt = accountState.TokenExpiresAt
+	}
+	info, err := client.BotInfo(ctx)
+	if err != nil {
+		return bot, err
+	}
+	accountState.TenantAccessToken = client.TenantToken
+	accountState.TokenExpiresAt = client.TenantTokenExpiresAt
+	accountState.BotOpenID = strings.TrimSpace(info.Bot.OpenID)
+	if err := store.SaveAccount(ctx, accountState); err != nil {
+		return bot, err
+	}
+	return larkBotIdentityFromAccountState(account, accountState), nil
 }
 
 func larkSenderID(id lark.SenderID) string {
