@@ -302,6 +302,39 @@ func TestLarkConnectorWebhookCreatesMessageAndDedupes(t *testing.T) {
 	}
 }
 
+func TestLarkConnectorWebhookCreatesMessageFromPostEnvelope(t *testing.T) {
+	connector := newTestWebhookConnector(t)
+	gateway := &fakeSDKGateway{}
+	store := newFakeSDKAccountStore()
+	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	body := []byte(`{
+		"schema":"2.0",
+		"header":{"event_id":"evt_post","event_type":"im.message.receive_v1","app_id":"cli_1","token":"verify-token"},
+		"event":{
+			"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
+			"message":{"message_id":"om_post","chat_id":"oc_group","chat_type":"group","message_type":"post","content":"{\"post\":{\"zh_cn\":{\"title\":\"公告\",\"content\":[[{\"tag\":\"text\",\"text\":\"第一行\"}],[{\"tag\":\"text\",\"text\":\"第二行\"}]]}}}","create_time":"1770000000000"}
+		}
+	}`)
+	result, err := connector.HandleWebhook(context.Background(), sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+		AccountStore:  store,
+	}, account, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Ignored || result.Inbound == nil {
+		t.Fatalf("result=%+v", result)
+	}
+	gateway.mu.Lock()
+	defer gateway.mu.Unlock()
+	if len(gateway.messages) != 1 || gateway.messages[0].Content != "**公告**\n\n第一行\n第二行" {
+		t.Fatalf("messages=%+v", gateway.messages)
+	}
+}
+
 func TestLarkConnectorHandleEventAcceptsWebSocketEvent(t *testing.T) {
 	connector := newTestEventConnector(t)
 	gateway := &fakeSDKGateway{}
@@ -445,6 +478,59 @@ func TestLarkConnectorHandleEventFetchesBotIdentity(t *testing.T) {
 	}
 	if got := store.state("account-1")["bot_open_id"]; got != "ou_bot_live" {
 		t.Fatalf("state bot_open_id=%#v", got)
+	}
+	if got := store.state("account-1")["bot_name"]; got != "Beak Bot" {
+		t.Fatalf("state bot_name=%#v", got)
+	}
+}
+
+func TestLarkConnectorHandleEventMatchesBotNameForUserIDPostMention(t *testing.T) {
+	connector := newTestEventConnector(t)
+	gateway := &fakeSDKGateway{}
+	store := newFakeSDKAccountStore()
+	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	var sawBotInfo bool
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "tenant-token", "expire": 7200})
+		case "/open-apis/bot/v3/info":
+			sawBotInfo = true
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "bot": map[string]any{"open_id": "ou_bot", "app_name": "Beak Bot"}})
+		default:
+			t.Fatalf("unexpected request: %s", req.URL.Path)
+			return nil, nil
+		}
+	})}
+	body := []byte(`{
+		"app_id":"cli_1",
+		"event_id":"evt_user_id_bot_mention",
+		"event_type":"im.message.receive_v1",
+		"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
+		"message":{"message_id":"om_user_id_bot_mention","chat_id":"oc_group","chat_type":"group","message_type":"post","content":"{\"zh_cn\":{\"content\":[[{\"tag\":\"at\",\"user_id\":\"user_bot\",\"user_name\":\"Beak Bot\"},{\"tag\":\"text\",\"text\":\" ping\"}]]}}","create_time":"1770000000000","mentions":[{"id":{"user_id":"user_bot"},"name":"Beak Bot"}]}
+	}`)
+	result, err := connector.HandleEvent(context.Background(), sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+		AccountStore:  store,
+		HTTPClient:    httpClient,
+	}, account, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawBotInfo {
+		t.Fatal("bot info endpoint was not called")
+	}
+	if result.Inbound == nil || !result.Inbound.MentionedMe || result.Inbound.Text != "ping" {
+		t.Fatalf("inbound=%+v", result.Inbound)
+	}
+	if len(gateway.messages) != 1 || gateway.messages[0].Content != "ping" {
+		t.Fatalf("messages=%+v", gateway.messages)
+	}
+	if got := store.state("account-1")["bot_name"]; got != "Beak Bot" {
+		t.Fatalf("state bot_name=%#v", got)
 	}
 }
 

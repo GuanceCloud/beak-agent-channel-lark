@@ -314,6 +314,54 @@ func TestEventMessagePostText(t *testing.T) {
 	}
 }
 
+func TestEventMessagePostTextUnwrapsPostLocaleEnvelope(t *testing.T) {
+	msg := EventMessage{
+		MessageType: "post",
+		Content: `{
+			"post":{
+				"zh_cn":{
+					"title":"公告",
+					"content":[
+						[{"tag":"text","text":"第一行"}],
+						[{"tag":"text","text":"第二行"}]
+					]
+				}
+			}
+		}`,
+	}
+	got := msg.Text()
+	want := "**公告**\n\n第一行\n第二行"
+	if got != want {
+		t.Fatalf("text=%q want=%q", got, want)
+	}
+}
+
+func TestEventMessagePostTextMatchesMentionUserID(t *testing.T) {
+	msg := EventMessage{
+		MessageType: "post",
+		Content: `{
+			"zh_cn":{
+				"content":[[
+					{"tag":"at","user_id":"user_bot","user_name":"Bot"},
+					{"tag":"text","text":" 和 "},
+					{"tag":"at","user_id":"user_alice","user_name":"Alice"}
+				]]
+			}
+		}`,
+		Mentions: []Mention{
+			{ID: SenderID{UserID: "user_bot"}, Name: "Bot"},
+			{Key: "@_alice", ID: SenderID{UserID: "user_alice"}, Name: "Alice"},
+		},
+	}
+	got := msg.TextWithMentionFilter(func(mention Mention) bool {
+		return mention.ID.UserID == "user_bot"
+	})
+	want := "和 @Alice"
+	if got != want {
+		t.Fatalf("text=%q want=%q", got, want)
+	}
+}
+
 func TestParseURLVerification(t *testing.T) {
 	hook, err := ParseWebhook([]byte(`{"type":"url_verification","challenge":"challenge-1","token":"verify-token"}`))
 	if err != nil {
