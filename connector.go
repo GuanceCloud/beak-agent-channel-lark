@@ -94,6 +94,50 @@ func (c Connector) CredentialSchema(context.Context) sdk.CredentialSchema {
 	}
 }
 
+func (Connector) ValidateCredential(ctx context.Context, req sdk.CredentialValidationRequest) (*sdk.CredentialValidationResult, error) {
+	credential := cloneMap(req.Credential)
+	state := cloneMap(req.State)
+	client := lark.NewClient(baseURLFromCredential(credential), stringValue(credential["app_id"]), stringValue(credential["app_secret"]))
+	client.HTTPClient = req.Runtime.HTTPClient
+
+	now := time.Now().UTC()
+	token, expiresAt, err := client.TenantAccessTokenWithExpiry(ctx, now)
+	if err != nil {
+		return credentialValidationFailure(credential, state, err), nil
+	}
+	info, err := client.BotInfo(ctx)
+	if err != nil {
+		return credentialValidationFailure(credential, state, err), nil
+	}
+
+	accountKey := firstString(credential["account_id"], credential["app_id"])
+	displayName := firstString(credential["display_name"], info.Bot.AppName, credential["app_id"])
+	if strings.TrimSpace(info.Bot.OpenID) != "" {
+		credential["bot_open_id"] = strings.TrimSpace(info.Bot.OpenID)
+		state["bot_open_id"] = strings.TrimSpace(info.Bot.OpenID)
+	}
+	if strings.TrimSpace(info.Bot.AppName) != "" {
+		credential["bot_name"] = strings.TrimSpace(info.Bot.AppName)
+		state["bot_name"] = strings.TrimSpace(info.Bot.AppName)
+	}
+	state["tenant_access_token"] = token
+	state["tenant_access_token_expires_at"] = expiresAt
+
+	return &sdk.CredentialValidationResult{
+		Valid:       true,
+		AccountKey:  accountKey,
+		DisplayName: displayName,
+		Credential:  credential,
+		State:       state,
+		Metadata: map[string]any{
+			"platform":        Platform,
+			"activate_status": info.Bot.ActivateStatus,
+			"avatar_url":      info.Bot.AvatarURL,
+			"ip_white_list":   info.Bot.IPWhiteList,
+		},
+	}, nil
+}
+
 func (Connector) StartLogin(context.Context, sdk.LoginStartRequest) (*sdk.LoginChallenge, error) {
 	return nil, ErrCredentialLogin
 }
@@ -980,6 +1024,30 @@ func firstValue(values ...any) any {
 		}
 	}
 	return nil
+}
+
+func cloneMap(value map[string]any) map[string]any {
+	out := make(map[string]any, len(value))
+	for key, item := range value {
+		out[key] = item
+	}
+	return out
+}
+
+func credentialValidationFailure(credential, state map[string]any, err error) *sdk.CredentialValidationResult {
+	message := ""
+	if err != nil {
+		message = err.Error()
+	}
+	return &sdk.CredentialValidationResult{
+		Valid:       false,
+		AccountKey:  firstString(credential["account_id"], credential["app_id"]),
+		DisplayName: firstString(credential["display_name"], credential["bot_name"], credential["app_id"]),
+		Credential:  credential,
+		State:       state,
+		Metadata:    map[string]any{"platform": Platform},
+		Error:       message,
+	}
 }
 
 func optionalBool(value any) *bool {

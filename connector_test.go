@@ -60,6 +60,89 @@ func TestLarkConnectorMetadataAndSchema(t *testing.T) {
 	}
 }
 
+func TestLarkConnectorValidateCredentialFetchesTokenAndBotInfo(t *testing.T) {
+	var sawToken bool
+	var sawBotInfo bool
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			sawToken = true
+			if req.Method != http.MethodPost {
+				t.Fatalf("token method=%s", req.Method)
+			}
+			var body map[string]string
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["app_id"] != "cli_validate" || body["app_secret"] != "secret_validate" {
+				t.Fatalf("token body=%+v", body)
+			}
+			return testJSONResponse(map[string]any{"code": 0, "tenant_access_token": "tenant-token-1", "expire": 3600})
+		case "/open-apis/bot/v3/info":
+			sawBotInfo = true
+			if got := req.Header.Get("Authorization"); got != "Bearer tenant-token-1" {
+				t.Fatalf("Authorization=%q", got)
+			}
+			return testJSONResponse(map[string]any{
+				"code": 0,
+				"bot": map[string]any{
+					"open_id":         "ou_validate_bot",
+					"app_name":        "Beak Validate Bot",
+					"activate_status": 1,
+					"avatar_url":      "https://example.test/avatar.png",
+				},
+			})
+		default:
+			t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+			return nil, nil
+		}
+	})}
+
+	result, err := NewConnector().ValidateCredential(context.Background(), sdk.CredentialValidationRequest{
+		Credential: map[string]any{
+			"app_id":     "cli_validate",
+			"app_secret": "secret_validate",
+			"brand":      "feishu",
+		},
+		Runtime: sdk.Runtime{HTTPClient: httpClient},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawToken || !sawBotInfo {
+		t.Fatalf("sawToken=%v sawBotInfo=%v", sawToken, sawBotInfo)
+	}
+	if !result.Valid || result.AccountKey != "cli_validate" || result.DisplayName != "Beak Validate Bot" {
+		t.Fatalf("result=%+v", result)
+	}
+	if result.Credential["bot_open_id"] != "ou_validate_bot" || result.State["tenant_access_token"] != "tenant-token-1" {
+		t.Fatalf("credential=%+v state=%+v", result.Credential, result.State)
+	}
+	if result.Metadata["activate_status"] != 1 {
+		t.Fatalf("metadata=%+v", result.Metadata)
+	}
+}
+
+func TestLarkConnectorValidateCredentialReturnsInvalidOnTokenFailure(t *testing.T) {
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/open-apis/auth/v3/tenant_access_token/internal" {
+			t.Fatalf("unexpected request: %s", req.URL.Path)
+		}
+		return testJSONResponse(map[string]any{"code": 999, "msg": "bad secret"})
+	})}
+
+	result, err := NewConnector().ValidateCredential(context.Background(), sdk.CredentialValidationRequest{
+		Credential: map[string]any{"app_id": "cli_bad", "app_secret": "bad"},
+		Runtime:    sdk.Runtime{HTTPClient: httpClient},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Valid || result.AccountKey != "cli_bad" || !strings.Contains(result.Error, "bad secret") {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
 func newTestEventConnector(t *testing.T) EventConnector {
 	t.Helper()
 	connector, ok := NewConnector().(EventConnector)
