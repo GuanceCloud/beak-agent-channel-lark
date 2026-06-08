@@ -17,6 +17,9 @@ This repository is importable library code. It is not a CLI, does not read user-
 - Optional reply delivery through `im/v1/messages/{message_id}/reply`.
 - Optional encrypted HTTP callback body decryption and request signature verification when `encrypt_key` is configured.
 - Direct chat and group chat normalization.
+- Thread id propagation for Lark replies and topics; the SDK still keeps `peer_sessions` chat-scoped.
+- Bot mention normalization where `@all` sets `mention_all` but not `mentioned_me`.
+- Explicit `@bot` messages with empty text after mention filtering are still delivered to Beak for follow-up handling.
 - One connected bot account plus one group chat maps to one Beak session; one connected bot account plus one direct chat maps to one Beak session.
 - If multiple bot accounts are in the same group, each account creates or reuses its own Beak session for that group.
 - One channel-link session is created per bot account connection, without creating a task.
@@ -88,6 +91,8 @@ Beak host should use `EventConnector` for the OpenClaw-aligned WebSocket path. U
 
 Beak host must encrypt credential JSON before persistence. The SDK does not write credential or state to local files.
 
+`ValidateCredential(ctx, req)` exchanges the app credential for a tenant token and fetches bot information when possible. The result backfills normalized credential/state fields and standard `bot_identity` / `bot_identities` state entries so later event handling can perform self-echo and mention detection without Beak host parsing Lark payloads.
+
 ## Runtime Boundary
 
 Beak host injects a `sdk.Runtime`:
@@ -132,6 +137,9 @@ if err != nil {
 - Already-decoded events from the host WebSocket runtime. The host's Lark `EventDispatcher` owns transport verification for this path.
 - Self-echo filtering when `bot_open_id` exists.
 - Standard `mentions` extraction and `mentioned_me` detection with `bot_open_id`.
+- `mention_all` is reported separately and does not imply `mentioned_me`.
+- Empty text is ignored only when the event did not explicitly mention the current bot.
+- `thread_id` / `parent_id` / `root_id` are propagated to Beak as thread context, while SDK peer-session cache keys remain `chat_type:chat_id`.
 - Dedupe by message id or event id.
 - Session creation/reuse through `sdk.Gateway.EnsureChatSession`.
 - Beak message creation through `sdk.Gateway.CreateMessage`.
@@ -225,6 +233,9 @@ Beak host stores account state. The SDK reads and writes through `sdk.AccountSto
 - `stream_cursors`: reserved Beak stream cursors.
 - `tenant_access_token` / `tenant_access_token_expires_at`: tenant token cache for send APIs.
 - `bot_open_id`: bot identity used for self-echo filtering.
+- `bot_identity` / `bot_identities`: standard bot identity cache used by the unified SDK contract.
+
+`peer_sessions` must stay chat-scoped. Thread context is available through inbound metadata and `EnsureChatSessionRequest.ThreadID`; do not treat a Lark thread as a different SDK peer-session key unless Beak product requirements explicitly move to thread-level sessions.
 
 ## Verification
 
