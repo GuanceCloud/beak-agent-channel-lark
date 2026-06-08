@@ -38,6 +38,9 @@ func TestLarkConnectorMetadataAndSchema(t *testing.T) {
 	if !metadata.Capabilities.Text || !metadata.Capabilities.DirectChat || !metadata.Capabilities.GroupChat || metadata.Capabilities.Media {
 		t.Fatalf("capabilities=%+v", metadata.Capabilities)
 	}
+	if !metadata.Capabilities.Stream || metadata.Capabilities.Webhook {
+		t.Fatalf("stream/webhook capabilities=%+v", metadata.Capabilities)
+	}
 	if len(metadata.Capabilities.LoginModes) != 1 || metadata.Capabilities.LoginModes[0] != sdk.LoginModeCredential {
 		t.Fatalf("login modes=%+v", metadata.Capabilities.LoginModes)
 	}
@@ -117,6 +120,10 @@ func TestLarkConnectorValidateCredentialFetchesTokenAndBotInfo(t *testing.T) {
 	}
 	if result.Credential["bot_open_id"] != "ou_validate_bot" || result.State["tenant_access_token"] != "tenant-token-1" {
 		t.Fatalf("credential=%+v state=%+v", result.Credential, result.State)
+	}
+	identity, ok := result.State["bot_identity"].(map[string]any)
+	if !ok || identity["id"] != "ou_validate_bot" || identity["id_type"] != "open_id" || identity["display_name"] != "Beak Validate Bot" {
+		t.Fatalf("bot_identity=%+v state=%+v", result.State["bot_identity"], result.State)
 	}
 	if result.Metadata["activate_status"] != 1 {
 		t.Fatalf("metadata=%+v", result.Metadata)
@@ -513,6 +520,44 @@ func TestLarkConnectorHandleEventUsesLoadedBotIdentity(t *testing.T) {
 	}
 }
 
+func TestLarkConnectorHandleEventUsesStandardBotIdentityState(t *testing.T) {
+	connector := newTestEventConnector(t)
+	gateway := &fakeSDKGateway{}
+	store := newFakeSDKAccountStore()
+	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	delete(account.Credential, "bot_open_id")
+	if err := store.SaveChannelAccountState(context.Background(), "account-1", map[string]any{
+		"bot_identities": []map[string]any{
+			{"id": "ou_bot_standard", "id_type": "open_id", "display_name": "Beak Bot"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{
+		"app_id":"cli_1",
+		"event_id":"evt_self_standard",
+		"event_type":"im.message.receive_v1",
+		"sender":{"sender_id":{"open_id":"ou_bot_standard"},"sender_type":"user"},
+		"message":{"message_id":"om_self_standard","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"self echo\"}","create_time":"1770000000000"}
+	}`)
+	result, err := connector.HandleEvent(context.Background(), sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+		AccountStore:  store,
+	}, account, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || !result.Ignored || result.Reason != "self_echo" {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(gateway.messages) != 0 {
+		t.Fatalf("messages=%+v", gateway.messages)
+	}
+}
+
 func TestLarkConnectorHandleEventFetchesBotIdentity(t *testing.T) {
 	connector := newTestEventConnector(t)
 	gateway := &fakeSDKGateway{}
@@ -564,6 +609,10 @@ func TestLarkConnectorHandleEventFetchesBotIdentity(t *testing.T) {
 	}
 	if got := store.state("account-1")["bot_name"]; got != "Beak Bot" {
 		t.Fatalf("state bot_name=%#v", got)
+	}
+	identity, ok := store.state("account-1")["bot_identity"].(map[string]any)
+	if !ok || identity["id"] != "ou_bot_live" || identity["id_type"] != "open_id" || identity["display_name"] != "Beak Bot" {
+		t.Fatalf("bot_identity=%+v state=%+v", store.state("account-1")["bot_identity"], store.state("account-1"))
 	}
 }
 
@@ -669,11 +718,89 @@ func TestLarkConnectorWebhookMentionAll(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Inbound == nil || !result.Inbound.MentionAll || !result.Inbound.MentionedMe || len(result.Inbound.Mentions) != 1 {
+	if result.Inbound == nil || !result.Inbound.MentionAll || result.Inbound.MentionedMe || len(result.Inbound.Mentions) != 1 {
 		t.Fatalf("inbound=%+v", result.Inbound)
 	}
 	if result.Inbound.Mentions[0].ID != "all" || result.Inbound.Mentions[0].IDType != "mention_all" {
 		t.Fatalf("mentions=%+v", result.Inbound.Mentions)
+	}
+}
+
+func TestLarkConnectorWebhookOnlyBotMentionIsDelivered(t *testing.T) {
+	connector := newTestWebhookConnector(t)
+	gateway := &fakeSDKGateway{}
+	store := newFakeSDKAccountStore()
+	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	body := []byte(`{
+		"schema":"2.0",
+		"header":{"event_id":"evt_only_bot","event_type":"im.message.receive_v1","app_id":"cli_1","token":"verify-token"},
+		"event":{
+			"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
+			"message":{"message_id":"om_only_bot","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"@_bot\"}","create_time":"1770000000000","mentions":[{"key":"@_bot","id":{"open_id":"ou_bot"},"name":"Beak Bot"}]}
+		}
+	}`)
+	result, err := connector.HandleWebhook(context.Background(), sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+		AccountStore:  store,
+	}, account, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Ignored || result.Inbound == nil || !result.Inbound.MentionedMe || strings.TrimSpace(result.Inbound.Text) != "" {
+		t.Fatalf("result=%+v", result)
+	}
+	gateway.mu.Lock()
+	defer gateway.mu.Unlock()
+	if len(gateway.messages) != 1 || strings.TrimSpace(gateway.messages[0].Content) != "" {
+		t.Fatalf("messages=%+v", gateway.messages)
+	}
+}
+
+func TestLarkConnectorWebhookThreadIDPropagates(t *testing.T) {
+	connector := newTestWebhookConnector(t)
+	gateway := &fakeSDKGateway{}
+	store := newFakeSDKAccountStore()
+	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	body := []byte(`{
+		"schema":"2.0",
+		"header":{"event_id":"evt_thread","event_type":"im.message.receive_v1","app_id":"cli_1","token":"verify-token"},
+		"event":{
+			"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
+			"message":{"message_id":"om_thread_reply","root_id":"om_root","parent_id":"om_parent","thread_id":"omt_thread","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"thread ping\"}","create_time":"1770000000000"}
+		}
+	}`)
+	result, err := connector.HandleWebhook(context.Background(), sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+		AccountStore:  store,
+	}, account, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Inbound == nil || result.Inbound.ThreadID != "omt_thread" {
+		t.Fatalf("inbound=%+v", result.Inbound)
+	}
+	gateway.mu.Lock()
+	defer gateway.mu.Unlock()
+	if len(gateway.chatSessions) != 1 || gateway.chatSessions[0].ThreadID != "omt_thread" {
+		t.Fatalf("chatSessions=%+v", gateway.chatSessions)
+	}
+	inbound, ok := gateway.messages[0].Metadata["inbound_message"].(sdk.InboundMessage)
+	if !ok || inbound.ThreadID != "omt_thread" {
+		t.Fatalf("metadata inbound=%+v metadata=%+v", inbound, gateway.messages[0].Metadata)
+	}
+	state := store.state("account-1")
+	peerSessions, ok := state["peer_sessions"].(map[string]string)
+	if !ok || peerSessions["group:oc_group"] != result.SessionUUID {
+		t.Fatalf("peer sessions=%+v", state["peer_sessions"])
+	}
+	if _, ok := peerSessions["group:oc_group:thread:omt_thread"]; ok {
+		t.Fatalf("peer sessions should stay chat-scoped, got %+v", peerSessions)
 	}
 }
 

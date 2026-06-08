@@ -68,6 +68,8 @@ func (c Connector) Metadata() sdk.ConnectorMetadata {
 			Media:          caps.Media,
 			GroupChat:      caps.GroupChat,
 			DirectChat:     caps.DirectChat,
+			Stream:         true,
+			Webhook:        false,
 			BlockStreaming: caps.BlockStreaming,
 		},
 	}
@@ -119,6 +121,13 @@ func (Connector) ValidateCredential(ctx context.Context, req sdk.CredentialValid
 	if strings.TrimSpace(info.Bot.AppName) != "" {
 		credential["bot_name"] = strings.TrimSpace(info.Bot.AppName)
 		state["bot_name"] = strings.TrimSpace(info.Bot.AppName)
+	}
+	if identities := larkBotIdentityState(larkBotIdentity{
+		OpenID: firstString(credential["bot_open_id"], state["bot_open_id"]),
+		Name:   firstString(credential["bot_name"], credential["bot_app_name"], state["bot_name"], state["bot_app_name"]),
+	}); len(identities) > 0 {
+		state["bot_identities"] = identities
+		state["bot_identity"] = identities[0]
 	}
 	state["tenant_access_token"] = token
 	state["tenant_access_token_expires_at"] = expiresAt
@@ -396,12 +405,18 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 		return larkMentionMatchesBot(mention, bot)
 	})
 	chat := hook.Event.Message.ChatIdentity(senderID)
-	if chat.ChatType == "" || chat.ChatID == "" || chat.SenderID == "" || text == "" {
+	inbound := buildInboundMessage(runtime.WorkspaceUUID, runtime.Channel.UUID, accountUUID, hook, text, bot)
+	if chat.ChatType == "" || chat.ChatID == "" || chat.SenderID == "" {
 		return &WebhookResult{Type: hook.EventType(), Ignored: true, Reason: "incomplete_or_non_text_message"}, nil
 	}
+	if strings.TrimSpace(text) == "" && !inbound.MentionedMe {
+		return &WebhookResult{Type: hook.EventType(), Ignored: true, Reason: "incomplete_or_non_text_message"}, nil
+	}
+	threadID := larkThreadID(hook.Event.Message)
+	stateKey := chat.StateKey()
 	key := hook.DedupeKey(accountUUID)
 	if _, ok := state.InboundSeen[key]; ok {
-		return &WebhookResult{Type: hook.EventType(), Ignored: true, Reason: "duplicate", SessionUUID: state.PeerSessions[chat.StateKey()]}, nil
+		return &WebhookResult{Type: hook.EventType(), Ignored: true, Reason: "duplicate", SessionUUID: state.PeerSessions[stateKey]}, nil
 	}
 
 	sessionUUID, err := runtime.Gateway.EnsureChatSession(ctx, sdk.EnsureChatSessionRequest{
@@ -410,6 +425,7 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 		AccountUUID:         accountUUID,
 		ChatType:            chat.ChatType,
 		ChatID:              chat.ChatID,
+		ThreadID:            threadID,
 		SenderID:            chat.SenderID,
 		AgentParticipantID:  runtime.Gateway.AgentParticipantID(),
 		BridgeParticipantID: runtime.Gateway.BridgeParticipantID(Platform),
@@ -421,7 +437,6 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 	if err != nil {
 		return nil, err
 	}
-	inbound := buildInboundMessage(runtime.WorkspaceUUID, runtime.Channel.UUID, accountUUID, hook, text, bot)
 	messageUUID, err := runtime.Gateway.CreateMessage(ctx, sdk.CreateMessageRequest{
 		WorkspaceUUID: runtime.WorkspaceUUID,
 		SessionUUID:   sessionUUID,
@@ -449,7 +464,7 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 	if err != nil {
 		return nil, err
 	}
-	state.PeerSessions[chat.StateKey()] = sessionUUID
+	state.PeerSessions[stateKey] = sessionUUID
 	state.InboundSeen[key] = time.Now().UTC().Format(time.RFC3339Nano)
 	if err := store.SaveAccount(ctx, state); err != nil {
 		return nil, err
@@ -466,6 +481,7 @@ func buildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *l
 	chat := hook.Event.Message.ChatIdentity(senderID)
 	mentions := larkMentionIdentities(hook.Event.Message.Mentions)
 	mentionAll := larkMentionsAll(hook.Event.Message.Mentions)
+	threadID := larkThreadID(hook.Event.Message)
 	return sdk.InboundMessage{
 		WorkspaceUUID: workspaceUUID,
 		Platform:      Platform,
@@ -473,12 +489,13 @@ func buildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *l
 		ChannelUUID:   channelUUID,
 		ChatType:      chat.ChatType,
 		ChatID:        chat.ChatID,
+		ThreadID:      threadID,
 		SenderID:      chat.SenderID,
 		MessageID:     hook.Event.Message.MessageID,
 		Text:          text,
 		DedupeKey:     hook.DedupeKey(accountUUID),
 		Mentions:      mentions,
-		MentionedMe:   mentionAll || larkMentionsBot(mentions, bot),
+		MentionedMe:   larkMentionsBot(mentions, bot),
 		MentionAll:    mentionAll,
 		Raw: map[string]any{
 			"event_id":     hook.EventID(),
@@ -497,6 +514,10 @@ func buildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *l
 			"mention_all":  mentionAll,
 		},
 	}
+}
+
+func larkThreadID(message lark.EventMessage) string {
+	return firstString(message.ThreadID, message.ParentID, message.RootID)
 }
 
 func larkMentionIdentities(mentions []lark.Mention) []sdk.MentionIdentity {
@@ -570,10 +591,10 @@ func larkEventOwnershipValid(account sdk.ChannelAccount, hook *lark.Webhook) boo
 
 func larkBotIdentityFromAccount(account sdk.ChannelAccount) larkBotIdentity {
 	return larkBotIdentity{
-		OpenID:  firstString(account.Credential["bot_open_id"], account.State["bot_open_id"]),
-		Name:    firstString(account.Credential["bot_name"], account.Credential["bot_app_name"], account.State["bot_name"], account.State["bot_app_name"]),
-		UserID:  firstString(account.Credential["bot_user_id"], account.State["bot_user_id"]),
-		UnionID: firstString(account.Credential["bot_union_id"], account.State["bot_union_id"]),
+		OpenID:  firstString(account.Credential["bot_open_id"], account.State["bot_open_id"], standardBotIdentityValue(account.State, "open_id")),
+		Name:    firstString(account.Credential["bot_name"], account.Credential["bot_app_name"], account.State["bot_name"], account.State["bot_app_name"], standardBotIdentityDisplayName(account.State)),
+		UserID:  firstString(account.Credential["bot_user_id"], account.State["bot_user_id"], standardBotIdentityValue(account.State, "user_id")),
+		UnionID: firstString(account.Credential["bot_union_id"], account.State["bot_union_id"], standardBotIdentityValue(account.State, "union_id")),
 	}
 }
 
@@ -582,10 +603,10 @@ func larkBotIdentityFromAccountState(account sdk.ChannelAccount, accountState *s
 		return larkBotIdentityFromAccount(account)
 	}
 	return larkBotIdentity{
-		OpenID:  firstString(account.Credential["bot_open_id"], accountState.BotOpenID, account.State["bot_open_id"]),
-		Name:    firstString(account.Credential["bot_name"], account.Credential["bot_app_name"], accountState.BotName, account.State["bot_name"], account.State["bot_app_name"]),
-		UserID:  firstString(account.Credential["bot_user_id"], accountState.BotUserID, account.State["bot_user_id"]),
-		UnionID: firstString(account.Credential["bot_union_id"], accountState.BotUnionID, account.State["bot_union_id"]),
+		OpenID:  firstString(account.Credential["bot_open_id"], accountState.BotOpenID, account.State["bot_open_id"], standardBotIdentityValue(account.State, "open_id")),
+		Name:    firstString(account.Credential["bot_name"], account.Credential["bot_app_name"], accountState.BotName, account.State["bot_name"], account.State["bot_app_name"], standardBotIdentityDisplayName(account.State)),
+		UserID:  firstString(account.Credential["bot_user_id"], accountState.BotUserID, account.State["bot_user_id"], standardBotIdentityValue(account.State, "user_id")),
+		UnionID: firstString(account.Credential["bot_union_id"], accountState.BotUnionID, account.State["bot_union_id"], standardBotIdentityValue(account.State, "union_id")),
 	}
 }
 
@@ -653,8 +674,6 @@ func larkMentionsBot(mentions []sdk.MentionIdentity, bot larkBotIdentity) bool {
 			if bot.UnionID != "" && id == bot.UnionID {
 				return true
 			}
-		case "mention_all":
-			return true
 		}
 		if bot.Name != "" && strings.TrimSpace(mention.DisplayName) == bot.Name {
 			return true
@@ -1163,10 +1182,10 @@ func sdkAccountToState(account sdk.ChannelAccount) state.AccountState {
 		Brand:              stringValue(account.Credential["brand"]),
 		TenantAccessToken:  stringValue(account.State["tenant_access_token"]),
 		TokenExpiresAt:     timeValue(account.State["tenant_access_token_expires_at"]),
-		BotOpenID:          firstString(account.Credential["bot_open_id"], account.State["bot_open_id"]),
-		BotName:            firstString(account.Credential["bot_name"], account.Credential["bot_app_name"], account.State["bot_name"], account.State["bot_app_name"]),
-		BotUserID:          firstString(account.Credential["bot_user_id"], account.State["bot_user_id"]),
-		BotUnionID:         firstString(account.Credential["bot_union_id"], account.State["bot_union_id"]),
+		BotOpenID:          firstString(account.Credential["bot_open_id"], account.State["bot_open_id"], standardBotIdentityValue(account.State, "open_id")),
+		BotName:            firstString(account.Credential["bot_name"], account.Credential["bot_app_name"], account.State["bot_name"], account.State["bot_app_name"], standardBotIdentityDisplayName(account.State)),
+		BotUserID:          firstString(account.Credential["bot_user_id"], account.State["bot_user_id"], standardBotIdentityValue(account.State, "user_id")),
+		BotUnionID:         firstString(account.Credential["bot_union_id"], account.State["bot_union_id"], standardBotIdentityValue(account.State, "union_id")),
 		ChannelLinkSession: stringValue(account.State["channel_link_session"]),
 		PeerSessions:       stringMap(account.State["peer_sessions"]),
 		InboundSeen:        stringMap(account.State["inbound_seen"]),
@@ -1199,7 +1218,111 @@ func accountStateToSDK(account state.AccountState, existing sdk.ChannelAccount) 
 		"bot_union_id":                   account.BotUnionID,
 		"updated_at":                     account.UpdatedAt,
 	}
+	if identities := larkBotIdentityState(larkBotIdentity{
+		OpenID:  account.BotOpenID,
+		Name:    account.BotName,
+		UserID:  account.BotUserID,
+		UnionID: account.BotUnionID,
+	}); len(identities) > 0 {
+		existing.State["bot_identities"] = identities
+		existing.State["bot_identity"] = identities[0]
+	}
 	return existing
+}
+
+func larkBotIdentityState(bot larkBotIdentity) []map[string]any {
+	var identities []map[string]any
+	add := func(id, idType string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		identity := map[string]any{
+			"id":      id,
+			"id_type": idType,
+		}
+		if name := strings.TrimSpace(bot.Name); name != "" {
+			identity["display_name"] = name
+		}
+		identities = append(identities, identity)
+	}
+	add(bot.OpenID, "open_id")
+	add(bot.UserID, "user_id")
+	add(bot.UnionID, "union_id")
+	return identities
+}
+
+func standardBotIdentityValue(state map[string]any, idTypes ...string) string {
+	wanted := make(map[string]struct{}, len(idTypes))
+	for _, idType := range idTypes {
+		idType = strings.TrimSpace(idType)
+		if idType != "" {
+			wanted[idType] = struct{}{}
+		}
+	}
+	for _, identity := range standardBotIdentityMaps(state) {
+		idType := strings.TrimSpace(stringValue(identity["id_type"]))
+		if len(wanted) > 0 {
+			if _, ok := wanted[idType]; !ok {
+				continue
+			}
+		}
+		if id := strings.TrimSpace(stringValue(identity["id"])); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+func standardBotIdentityDisplayName(state map[string]any) string {
+	for _, identity := range standardBotIdentityMaps(state) {
+		if name := firstString(identity["display_name"], identity["displayName"], identity["name"]); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+func standardBotIdentityMaps(state map[string]any) []map[string]any {
+	if len(state) == 0 {
+		return nil
+	}
+	var out []map[string]any
+	out = append(out, botIdentityMapsFromAny(state["bot_identities"])...)
+	out = append(out, botIdentityMapsFromAny(state["bot_identity"])...)
+	return out
+}
+
+func botIdentityMapsFromAny(value any) []map[string]any {
+	switch typed := value.(type) {
+	case nil:
+		return nil
+	case map[string]any:
+		return []map[string]any{typed}
+	case []map[string]any:
+		return typed
+	case []any:
+		out := make([]map[string]any, 0, len(typed))
+		for _, item := range typed {
+			out = append(out, botIdentityMapsFromAny(item)...)
+		}
+		return out
+	case json.RawMessage:
+		var list []map[string]any
+		if err := json.Unmarshal(typed, &list); err == nil {
+			return list
+		}
+		var item map[string]any
+		if err := json.Unmarshal(typed, &item); err == nil {
+			return []map[string]any{item}
+		}
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return nil
+		}
+		return botIdentityMapsFromAny(json.RawMessage(typed))
+	}
+	return nil
 }
 
 func timeValue(value any) time.Time {
