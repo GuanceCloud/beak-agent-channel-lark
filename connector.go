@@ -113,6 +113,9 @@ func (Connector) ValidateCredential(ctx context.Context, req sdk.CredentialValid
 	}
 
 	accountKey := firstString(credential["account_id"], credential["app_id"])
+	if accountKey != "" {
+		credential["account_id"] = accountKey
+	}
 	displayName := firstString(credential["display_name"], info.Bot.AppName, credential["app_id"])
 	if strings.TrimSpace(info.Bot.OpenID) != "" {
 		credential["bot_open_id"] = strings.TrimSpace(info.Bot.OpenID)
