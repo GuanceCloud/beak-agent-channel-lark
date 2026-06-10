@@ -429,12 +429,14 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 		ChatType:            chat.ChatType,
 		ChatID:              chat.ChatID,
 		ThreadID:            threadID,
+		ChatIdentity:        larkSDKChatIdentity(chat),
 		SenderID:            chat.SenderID,
 		AgentParticipantID:  runtime.Gateway.AgentParticipantID(),
 		BridgeParticipantID: runtime.Gateway.BridgeParticipantID(Platform),
 		Metadata: map[string]any{
-			"source":       Platform,
-			"account_uuid": accountUUID,
+			"source":        Platform,
+			"account_uuid":  accountUUID,
+			"chat_identity": larkSDKChatIdentity(chat),
 		},
 	})
 	if err != nil {
@@ -493,6 +495,7 @@ func buildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *l
 		ChatType:      chat.ChatType,
 		ChatID:        chat.ChatID,
 		ThreadID:      threadID,
+		ChatIdentity:  larkSDKChatIdentity(chat),
 		SenderID:      chat.SenderID,
 		MessageID:     hook.Event.Message.MessageID,
 		Text:          text,
@@ -501,26 +504,35 @@ func buildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *l
 		MentionedMe:   larkMentionsBot(mentions, bot),
 		MentionAll:    mentionAll,
 		Raw: map[string]any{
-			"event_id":     hook.EventID(),
-			"event_type":   hook.EventType(),
-			"app_id":       hook.Header.AppID,
-			"chat_id":      hook.Event.Message.ChatID,
-			"chat_type":    hook.Event.Message.ChatType,
-			"message_id":   hook.Event.Message.MessageID,
-			"root_id":      hook.Event.Message.RootID,
-			"parent_id":    hook.Event.Message.ParentID,
-			"thread_id":    hook.Event.Message.ThreadID,
-			"message_type": hook.Event.Message.MessageType,
-			"sender_id":    hook.Event.Sender.SenderID,
-			"create_time":  hook.Event.Message.CreateTime,
-			"mentions":     hook.Event.Message.Mentions,
-			"mention_all":  mentionAll,
+			"event_id":      hook.EventID(),
+			"event_type":    hook.EventType(),
+			"app_id":        hook.Header.AppID,
+			"chat_id":       hook.Event.Message.ChatID,
+			"chat_type":     hook.Event.Message.ChatType,
+			"chat_identity": larkSDKChatIdentity(chat),
+			"message_id":    hook.Event.Message.MessageID,
+			"root_id":       hook.Event.Message.RootID,
+			"parent_id":     hook.Event.Message.ParentID,
+			"thread_id":     hook.Event.Message.ThreadID,
+			"message_type":  hook.Event.Message.MessageType,
+			"sender_id":     hook.Event.Sender.SenderID,
+			"create_time":   hook.Event.Message.CreateTime,
+			"mentions":      hook.Event.Message.Mentions,
+			"mention_all":   mentionAll,
 		},
 	}
 }
 
 func larkThreadID(message lark.EventMessage) string {
 	return firstString(message.ThreadID, message.ParentID, message.RootID)
+}
+
+func larkSDKChatIdentity(chat lark.ChatIdentity) sdk.ChatIdentity {
+	return sdk.ChatIdentity{
+		ID:     strings.TrimSpace(chat.ChatID),
+		IDType: "chat_id",
+		Type:   strings.TrimSpace(chat.ChatType),
+	}
 }
 
 func larkMentionIdentities(mentions []lark.Mention) []sdk.MentionIdentity {
