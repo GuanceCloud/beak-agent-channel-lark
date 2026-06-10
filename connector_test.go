@@ -785,14 +785,23 @@ func TestLarkConnectorWebhookThreadIDPropagates(t *testing.T) {
 	if result.Inbound == nil || result.Inbound.ThreadID != "omt_thread" {
 		t.Fatalf("inbound=%+v", result.Inbound)
 	}
+	if result.Inbound.ChatIdentity.ID != "oc_group" || result.Inbound.ChatIdentity.Type != sdk.ChatTypeGroup {
+		t.Fatalf("chat identity=%+v", result.Inbound.ChatIdentity)
+	}
 	gateway.mu.Lock()
 	defer gateway.mu.Unlock()
 	if len(gateway.chatSessions) != 1 || gateway.chatSessions[0].ThreadID != "omt_thread" {
 		t.Fatalf("chatSessions=%+v", gateway.chatSessions)
 	}
+	if gateway.chatSessions[0].ChatIdentity.ID != "oc_group" || gateway.chatSessions[0].ChatIdentity.Type != sdk.ChatTypeGroup {
+		t.Fatalf("chat session identity=%+v", gateway.chatSessions[0].ChatIdentity)
+	}
 	inbound, ok := gateway.messages[0].Metadata["inbound_message"].(sdk.InboundMessage)
 	if !ok || inbound.ThreadID != "omt_thread" {
 		t.Fatalf("metadata inbound=%+v metadata=%+v", inbound, gateway.messages[0].Metadata)
+	}
+	if inbound.ChatIdentity.ID != "oc_group" || inbound.ChatIdentity.Type != sdk.ChatTypeGroup {
+		t.Fatalf("metadata inbound identity=%+v", inbound.ChatIdentity)
 	}
 	state := store.state("account-1")
 	peerSessions, ok := state["peer_sessions"].(map[string]string)

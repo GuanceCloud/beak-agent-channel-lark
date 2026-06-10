@@ -140,6 +140,7 @@ if err != nil {
 - `mention_all` is reported separately and does not imply `mentioned_me`.
 - Empty text is ignored only when the event did not explicitly mention the current bot.
 - `thread_id` / `parent_id` / `root_id` are propagated to Beak as thread context, while SDK peer-session cache keys remain `chat_type:chat_id`.
+- Standard `chat_identity.id/type` is propagated from Lark `chat_id/chat_type`; `chat_display_name` stays empty unless the SDK receives or resolves a reliable chat name.
 - Dedupe by message id or event id.
 - Session creation/reuse through `sdk.Gateway.EnsureChatSession`.
 - Beak message creation through `sdk.Gateway.CreateMessage`.
