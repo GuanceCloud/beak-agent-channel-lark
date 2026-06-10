@@ -24,6 +24,8 @@ type AccountState struct {
 	BotUnionID         string            `json:"bot_union_id,omitempty"`
 	ChannelLinkSession string            `json:"channel_link_session,omitempty"`
 	PeerSessions       map[string]string `json:"peer_sessions,omitempty"`
+	UserDisplayNames   map[string]string `json:"user_display_names,omitempty"`
+	ChatDisplayNames   map[string]string `json:"chat_display_names,omitempty"`
 	InboundSeen        map[string]string `json:"inbound_seen,omitempty"`
 	SentBeakMessages   map[string]string `json:"sent_beak_messages,omitempty"`
 	StreamCursors      map[string]string `json:"stream_cursors,omitempty"`
@@ -36,6 +38,12 @@ func (a *AccountState) EnsureMaps() {
 	}
 	if a.PeerSessions == nil {
 		a.PeerSessions = make(map[string]string)
+	}
+	if a.UserDisplayNames == nil {
+		a.UserDisplayNames = make(map[string]string)
+	}
+	if a.ChatDisplayNames == nil {
+		a.ChatDisplayNames = make(map[string]string)
 	}
 	if a.InboundSeen == nil {
 		a.InboundSeen = make(map[string]string)
@@ -59,6 +67,8 @@ func TouchAccount(account *AccountState) error {
 	now := time.Now().UTC()
 	pruneTimestampMap(account.InboundSeen, now)
 	pruneTimestampMap(account.SentBeakMessages, now)
+	pruneStringMap(account.UserDisplayNames)
+	pruneStringMap(account.ChatDisplayNames)
 	account.UpdatedAt = now
 	return nil
 }
@@ -90,5 +100,20 @@ func pruneTimestampMap(values map[string]string, now time.Time) {
 	for len(values) > maxTrackedStateKeys && len(items) > 0 {
 		delete(values, items[0].key)
 		items = items[1:]
+	}
+}
+
+func pruneStringMap(values map[string]string) {
+	if len(values) <= maxTrackedStateKeys {
+		return
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for len(values) > maxTrackedStateKeys && len(keys) > 0 {
+		delete(values, keys[0])
+		keys = keys[1:]
 	}
 }

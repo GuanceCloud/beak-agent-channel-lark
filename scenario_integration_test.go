@@ -271,6 +271,8 @@ func TestLarkScenarioCredentialInboundAndFixedReply(t *testing.T) {
 				text:          content["text"],
 			}
 			return scenarioJSONResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"message_id": "om-fixed-reply", "chat_id": "oc_fixed"}})
+		case "/open-apis/contact/v3/users/ou_user_fixed", "/open-apis/im/v1/chats/oc_fixed":
+			return scenarioJSONResponse(map[string]any{"code": 99991663, "msg": "permission denied"})
 		default:
 			t.Fatalf("unexpected request path: %s", r.URL.Path)
 		}
@@ -384,6 +386,8 @@ func TestLarkScenarioMentionsInboundAndOutbound(t *testing.T) {
 				text:          content["text"],
 			}
 			return scenarioJSONResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"message_id": "om-mention-reply", "chat_id": "oc_mentions"}})
+		case "/open-apis/contact/v3/users/ou_user_mention", "/open-apis/im/v1/chats/oc_mentions":
+			return scenarioJSONResponse(map[string]any{"code": 99991663, "msg": "permission denied"})
 		default:
 			t.Fatalf("unexpected request path: %s", r.URL.Path)
 		}
@@ -485,6 +489,8 @@ func TestLarkScenarioWebSocketEventDirectReply(t *testing.T) {
 			sent.text = content["text"]
 			sent.replyInThread = body.ReplyInThread
 			return scenarioJSONResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"message_id": "om-direct-reply", "chat_id": "oc_direct"}})
+		case "/open-apis/contact/v3/users/ou_direct_user":
+			return scenarioJSONResponse(map[string]any{"code": 99991663, "msg": "permission denied"})
 		default:
 			t.Fatalf("unexpected request path: %s", r.URL.Path)
 		}

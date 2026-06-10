@@ -155,6 +155,76 @@ func TestClientBotInfoUsesTenantToken(t *testing.T) {
 	}
 }
 
+func TestClientUserInfoAndChatInfo(t *testing.T) {
+	var sawUserInfo bool
+	var sawChatInfo bool
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/open-apis/contact/v3/users/ou_user":
+			sawUserInfo = true
+			if r.Method != http.MethodGet {
+				t.Fatalf("user method=%s", r.Method)
+			}
+			if got := r.URL.Query().Get("user_id_type"); got != "open_id" {
+				t.Fatalf("user_id_type=%q", got)
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer cached-token" {
+				t.Fatalf("auth=%q", got)
+			}
+			return jsonResponse(map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{
+					"user": map[string]any{
+						"open_id": "ou_user",
+						"name":    "Alice",
+					},
+				},
+			})
+		case "/open-apis/im/v1/chats/oc_group":
+			sawChatInfo = true
+			if r.Method != http.MethodGet {
+				t.Fatalf("chat method=%s", r.Method)
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer cached-token" {
+				t.Fatalf("auth=%q", got)
+			}
+			return jsonResponse(map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{
+					"chat_id":    "oc_group",
+					"name":       "Team",
+					"avatar_url": "https://example.test/team.png",
+				},
+			})
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+		}
+		return nil, nil
+	})}
+	client := NewClient("https://open.feishu.test", "cli_1", "secret_1")
+	client.HTTPClient = httpClient
+	client.TenantToken = "cached-token"
+	userInfo, err := client.UserInfo(context.Background(), "ou_user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chatInfo, err := client.ChatInfo(context.Background(), "oc_group")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawUserInfo || !sawChatInfo {
+		t.Fatalf("sawUserInfo=%v sawChatInfo=%v", sawUserInfo, sawChatInfo)
+	}
+	if userInfo.DisplayName() != "Alice" {
+		t.Fatalf("userInfo=%+v", userInfo)
+	}
+	if chatInfo.DisplayName() != "Team" || chatInfo.AvatarURL() != "https://example.test/team.png" {
+		t.Fatalf("chatInfo=%+v", chatInfo)
+	}
+}
+
 func TestClientSendGenericAndReplyMessage(t *testing.T) {
 	var sawSend bool
 	var sawReply bool

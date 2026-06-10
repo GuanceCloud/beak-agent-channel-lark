@@ -575,6 +575,8 @@ func TestLarkConnectorHandleEventFetchesBotIdentity(t *testing.T) {
 				t.Fatalf("auth=%q", got)
 			}
 			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "bot": map[string]any{"open_id": "ou_bot_live", "app_name": "Beak Bot"}})
+		case "/open-apis/contact/v3/users/ou_user", "/open-apis/im/v1/chats/oc_group":
+			return testJSONResponse(map[string]any{"code": 99991663, "msg": "permission denied"})
 		default:
 			t.Fatalf("unexpected request: %s", req.URL.Path)
 			return nil, nil
@@ -629,6 +631,8 @@ func TestLarkConnectorHandleEventMatchesBotNameForUserIDPostMention(t *testing.T
 		case "/open-apis/bot/v3/info":
 			sawBotInfo = true
 			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "bot": map[string]any{"open_id": "ou_bot", "app_name": "Beak Bot"}})
+		case "/open-apis/contact/v3/users/ou_user", "/open-apis/im/v1/chats/oc_group":
+			return testJSONResponse(map[string]any{"code": 99991663, "msg": "permission denied"})
 		default:
 			t.Fatalf("unexpected request: %s", req.URL.Path)
 			return nil, nil
@@ -810,6 +814,152 @@ func TestLarkConnectorWebhookThreadIDPropagates(t *testing.T) {
 	}
 	if _, ok := peerSessions["group:oc_group:thread:omt_thread"]; ok {
 		t.Fatalf("peer sessions should stay chat-scoped, got %+v", peerSessions)
+	}
+}
+
+func TestLarkConnectorWebhookResolvesDisplayNames(t *testing.T) {
+	connector := newTestWebhookConnector(t)
+	gateway := &fakeSDKGateway{}
+	store := newFakeSDKAccountStore()
+	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	var sawUserInfo bool
+	var sawChatInfo bool
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "tenant-token", "expire": 7200})
+		case "/open-apis/contact/v3/users/ou_user":
+			sawUserInfo = true
+			if got := req.URL.Query().Get("user_id_type"); got != "open_id" {
+				t.Fatalf("user_id_type=%q", got)
+			}
+			if got := req.Header.Get("Authorization"); got != "Bearer tenant-token" {
+				t.Fatalf("auth=%q", got)
+			}
+			return testJSONResponse(map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{"user": map[string]any{"open_id": "ou_user", "name": "Alice"}},
+			})
+		case "/open-apis/im/v1/chats/oc_group":
+			sawChatInfo = true
+			if got := req.Header.Get("Authorization"); got != "Bearer tenant-token" {
+				t.Fatalf("auth=%q", got)
+			}
+			return testJSONResponse(map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{"chat_id": "oc_group", "name": "Team", "avatar_url": "https://example.test/team.png"},
+			})
+		default:
+			t.Fatalf("unexpected request: %s", req.URL.Path)
+		}
+		return nil, nil
+	})}
+	body := []byte(`{
+		"schema":"2.0",
+		"header":{"event_id":"evt_display_name","event_type":"im.message.receive_v1","app_id":"cli_1","token":"verify-token"},
+		"event":{
+			"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
+			"message":{"message_id":"om_display_name","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"hello names\"}","create_time":"1770000000000"}
+		}
+	}`)
+	result, err := connector.HandleWebhook(context.Background(), sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+		AccountStore:  store,
+		HTTPClient:    httpClient,
+	}, account, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawUserInfo || !sawChatInfo {
+		t.Fatalf("sawUserInfo=%v sawChatInfo=%v", sawUserInfo, sawChatInfo)
+	}
+	if result.Inbound == nil || result.Inbound.SenderDisplayName != "Alice" || result.Inbound.ChatDisplayName != "Team" || result.Inbound.ChatAvatarURL != "https://example.test/team.png" {
+		t.Fatalf("inbound=%+v", result.Inbound)
+	}
+	if result.Inbound.ChatIdentity.DisplayName != "Team" {
+		t.Fatalf("chat identity=%+v", result.Inbound.ChatIdentity)
+	}
+	if result.Inbound.ChatIdentity.AvatarURL != "https://example.test/team.png" {
+		t.Fatalf("chat identity avatar=%+v", result.Inbound.ChatIdentity)
+	}
+	gateway.mu.Lock()
+	defer gateway.mu.Unlock()
+	if len(gateway.chatSessions) != 1 {
+		t.Fatalf("chatSessions=%+v", gateway.chatSessions)
+	}
+	chatReq := gateway.chatSessions[0]
+	if chatReq.ChatDisplayName != "Team" || chatReq.ChatAvatarURL != "https://example.test/team.png" || chatReq.ChatIdentity.DisplayName != "Team" {
+		t.Fatalf("chatReq=%+v", chatReq)
+	}
+	if chatReq.ChatIdentity.AvatarURL != "https://example.test/team.png" || chatReq.Metadata["chat_display_name"] != "Team" || chatReq.Metadata["chat_avatar_url"] != "https://example.test/team.png" {
+		t.Fatalf("chatReq identity/metadata=%+v metadata=%+v", chatReq.ChatIdentity, chatReq.Metadata)
+	}
+	inbound, ok := gateway.messages[0].Metadata["inbound_message"].(sdk.InboundMessage)
+	if !ok || inbound.SenderDisplayName != "Alice" || inbound.ChatDisplayName != "Team" || inbound.ChatIdentity.DisplayName != "Team" {
+		t.Fatalf("metadata inbound=%+v metadata=%+v", inbound, gateway.messages[0].Metadata)
+	}
+	if gateway.messages[0].Metadata["chat_display_name"] != "Team" || gateway.messages[0].Metadata["chat_avatar_url"] != "https://example.test/team.png" || gateway.messages[0].Metadata["sender_display_name"] != "Alice" {
+		t.Fatalf("message metadata=%+v", gateway.messages[0].Metadata)
+	}
+	state := store.state("account-1")
+	if users, ok := state["user_display_names"].(map[string]string); !ok || users["ou_user"] != "Alice" {
+		t.Fatalf("user_display_names=%+v", state["user_display_names"])
+	}
+	if chats, ok := state["chat_display_names"].(map[string]string); !ok || chats["oc_group"] != "Team" {
+		t.Fatalf("chat_display_names=%+v", state["chat_display_names"])
+	}
+}
+
+func TestLarkConnectorWebhookIgnoresDisplayNameLookupFailure(t *testing.T) {
+	connector := newTestWebhookConnector(t)
+	gateway := &fakeSDKGateway{}
+	store := newFakeSDKAccountStore()
+	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "tenant-token", "expire": 7200})
+		case "/open-apis/contact/v3/users/ou_user", "/open-apis/im/v1/chats/oc_group":
+			return testJSONResponse(map[string]any{"code": 99991663, "msg": "permission denied"})
+		default:
+			t.Fatalf("unexpected request: %s", req.URL.Path)
+		}
+		return nil, nil
+	})}
+	body := []byte(`{
+		"schema":"2.0",
+		"header":{"event_id":"evt_display_name_failed","event_type":"im.message.receive_v1","app_id":"cli_1","token":"verify-token"},
+		"event":{
+			"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
+			"message":{"message_id":"om_display_name_failed","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"hello without names\"}","create_time":"1770000000000"}
+		}
+	}`)
+	result, err := connector.HandleWebhook(context.Background(), sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+		AccountStore:  store,
+		HTTPClient:    httpClient,
+	}, account, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Ignored || result.Inbound == nil || result.Inbound.Text != "hello without names" {
+		t.Fatalf("result=%+v", result)
+	}
+	if result.Inbound.SenderDisplayName != "" || result.Inbound.ChatDisplayName != "" {
+		t.Fatalf("inbound=%+v", result.Inbound)
+	}
+	gateway.mu.Lock()
+	defer gateway.mu.Unlock()
+	if len(gateway.messages) != 1 || gateway.messages[0].Content != "hello without names" {
+		t.Fatalf("messages=%+v", gateway.messages)
 	}
 }
 

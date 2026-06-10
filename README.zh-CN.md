@@ -150,7 +150,7 @@ if err != nil {
 - `mention_all` 单独上报，不等价于 `mentioned_me`。
 - 只有事件没有明确提及当前 bot 时，空正文才会被忽略。
 - `thread_id` / `parent_id` / `root_id` 会作为 thread 上下文透传给 Beak，但 SDK 的 peer-session 缓存 key 仍是 `chat_type:chat_id`。
-- 标准 `chat_identity.id/type` 来自飞书 `chat_id/chat_type`；除非 SDK 从事件或 API 获得可靠 chat 名称，否则 `chat_display_name` 保持为空。
+- 标准 `chat_identity.id/type` 来自飞书 `chat_id/chat_type`。当 host 提供 `Runtime.HTTPClient` 时，SDK 会尽力通过飞书用户信息接口补全 `sender_display_name`，并通过飞书 chat 信息接口补全群聊 `chat_display_name`；查询失败时名称保持为空，不影响入站消息投递。
 - 按 message id 或 event id 去重。
 - 通过 `sdk.Gateway.EnsureChatSession` 创建或复用 session。
 - 通过 `sdk.Gateway.CreateMessage` 写入 Beak message。

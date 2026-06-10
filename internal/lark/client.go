@@ -93,6 +93,44 @@ func (c *Client) BotInfo(ctx context.Context) (*BotInfoResponse, error) {
 	return &resp, nil
 }
 
+func (c *Client) UserInfo(ctx context.Context, openID string) (*UserInfoResponse, error) {
+	openID = strings.TrimSpace(openID)
+	if openID == "" {
+		return nil, fmt.Errorf("open_id is required")
+	}
+	token, err := c.tokenForRequest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var resp UserInfoResponse
+	if err := c.doJSON(ctx, http.MethodGet, "/contact/v3/users/"+url.PathEscape(openID), map[string]string{"user_id_type": "open_id"}, nil, &resp, withBearer(token)); err != nil {
+		return nil, err
+	}
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("user info failed: code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	return &resp, nil
+}
+
+func (c *Client) ChatInfo(ctx context.Context, chatID string) (*ChatInfoResponse, error) {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return nil, fmt.Errorf("chat_id is required")
+	}
+	token, err := c.tokenForRequest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var resp ChatInfoResponse
+	if err := c.doJSON(ctx, http.MethodGet, "/im/v1/chats/"+url.PathEscape(chatID), nil, nil, &resp, withBearer(token)); err != nil {
+		return nil, err
+	}
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("chat info failed: code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	return &resp, nil
+}
+
 func (c *Client) SendText(ctx context.Context, req SendTextRequest) (*SendTextResponse, error) {
 	if strings.TrimSpace(req.ReceiveID) == "" {
 		return nil, fmt.Errorf("receive_id is required")

@@ -70,6 +70,49 @@ type SendMessageResponse struct {
 	} `json:"data"`
 }
 
+type UserInfoResponse struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		User struct {
+			OpenID      string `json:"open_id"`
+			Name        string `json:"name"`
+			DisplayName string `json:"display_name"`
+			Nickname    string `json:"nickname"`
+			EnName      string `json:"en_name"`
+		} `json:"user"`
+	} `json:"data"`
+}
+
+func (r UserInfoResponse) DisplayName() string {
+	return firstNonEmptyString(r.Data.User.Name, r.Data.User.DisplayName, r.Data.User.Nickname, r.Data.User.EnName)
+}
+
+type ChatInfoResponse struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		ChatID    string `json:"chat_id"`
+		Name      string `json:"name"`
+		Avatar    string `json:"avatar"`
+		AvatarURL string `json:"avatar_url"`
+		Chat      struct {
+			ChatID    string `json:"chat_id"`
+			Name      string `json:"name"`
+			Avatar    string `json:"avatar"`
+			AvatarURL string `json:"avatar_url"`
+		} `json:"chat"`
+	} `json:"data"`
+}
+
+func (r ChatInfoResponse) DisplayName() string {
+	return firstNonEmptyString(r.Data.Name, r.Data.Chat.Name)
+}
+
+func (r ChatInfoResponse) AvatarURL() string {
+	return firstNonEmptyString(r.Data.AvatarURL, r.Data.Avatar, r.Data.Chat.AvatarURL, r.Data.Chat.Avatar)
+}
+
 type Webhook struct {
 	Type      string
 	Token     string
@@ -128,6 +171,8 @@ type ChatIdentity struct {
 	ChatID        string
 	SenderID      string
 	ReplyTargetID string
+	DisplayName   string
+	AvatarURL     string
 }
 
 func ParseWebhook(data []byte) (*Webhook, error) {
@@ -425,6 +470,15 @@ func anyStringSlice(value any) []string {
 		}
 	}
 	return out
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func firstNonEmptyAny(values ...any) any {
