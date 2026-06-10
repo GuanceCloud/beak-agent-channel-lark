@@ -421,6 +421,8 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 	if _, ok := state.InboundSeen[key]; ok {
 		return &WebhookResult{Type: hook.EventType(), Ignored: true, Reason: "duplicate", SessionUUID: state.PeerSessions[stateKey]}, nil
 	}
+	senderDisplayName := resolveLarkDisplayNames(ctx, runtime, account, state, &chat, hook.Event.Sender)
+	inbound = buildInboundMessageWithIdentity(runtime.WorkspaceUUID, runtime.Channel.UUID, accountUUID, hook, text, bot, chat, senderDisplayName)
 
 	sessionUUID, err := runtime.Gateway.EnsureChatSession(ctx, sdk.EnsureChatSessionRequest{
 		WorkspaceUUID:       runtime.WorkspaceUUID,
@@ -429,19 +431,24 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 		ChatType:            chat.ChatType,
 		ChatID:              chat.ChatID,
 		ThreadID:            threadID,
+		ChatDisplayName:     chat.DisplayName,
+		ChatAvatarURL:       chat.AvatarURL,
 		ChatIdentity:        larkSDKChatIdentity(chat),
 		SenderID:            chat.SenderID,
 		AgentParticipantID:  runtime.Gateway.AgentParticipantID(),
 		BridgeParticipantID: runtime.Gateway.BridgeParticipantID(Platform),
 		Metadata: map[string]any{
-			"source":        Platform,
-			"account_uuid":  accountUUID,
-			"chat_identity": larkSDKChatIdentity(chat),
+			"source":            Platform,
+			"account_uuid":      accountUUID,
+			"chat_display_name": strings.TrimSpace(chat.DisplayName),
+			"chat_avatar_url":   strings.TrimSpace(chat.AvatarURL),
+			"chat_identity":     larkSDKChatIdentity(chat),
 		},
 	})
 	if err != nil {
 		return nil, err
 	}
+	senderDisplayName = strings.TrimSpace(senderDisplayName)
 	messageUUID, err := runtime.Gateway.CreateMessage(ctx, sdk.CreateMessageRequest{
 		WorkspaceUUID: runtime.WorkspaceUUID,
 		SessionUUID:   sessionUUID,
@@ -449,21 +456,24 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 		Content:       text,
 		DedupeKey:     key,
 		Metadata: map[string]any{
-			"source":            Platform,
-			"platform":          Platform,
-			"account_uuid":      accountUUID,
-			"lark_account_id":   accountUUID,
-			"lark_app_id":       stringValue(account.Credential["app_id"]),
-			"lark_chat_type":    chat.ChatType,
-			"lark_chat_id":      chat.ChatID,
-			"lark_sender_id":    chat.SenderID,
-			"lark_message_id":   hook.Event.Message.MessageID,
-			"lark_root_id":      hook.Event.Message.RootID,
-			"lark_parent_id":    hook.Event.Message.ParentID,
-			"lark_thread_id":    hook.Event.Message.ThreadID,
-			"lark_event_id":     hook.EventID(),
-			"lark_message_type": hook.Event.Message.MessageType,
-			"inbound_message":   inbound,
+			"source":              Platform,
+			"platform":            Platform,
+			"account_uuid":        accountUUID,
+			"lark_account_id":     accountUUID,
+			"lark_app_id":         stringValue(account.Credential["app_id"]),
+			"lark_chat_type":      chat.ChatType,
+			"lark_chat_id":        chat.ChatID,
+			"lark_sender_id":      chat.SenderID,
+			"chat_display_name":   strings.TrimSpace(chat.DisplayName),
+			"chat_avatar_url":     strings.TrimSpace(chat.AvatarURL),
+			"sender_display_name": senderDisplayName,
+			"lark_message_id":     hook.Event.Message.MessageID,
+			"lark_root_id":        hook.Event.Message.RootID,
+			"lark_parent_id":      hook.Event.Message.ParentID,
+			"lark_thread_id":      hook.Event.Message.ThreadID,
+			"lark_event_id":       hook.EventID(),
+			"lark_message_type":   hook.Event.Message.MessageType,
+			"inbound_message":     inbound,
 		},
 	})
 	if err != nil {
@@ -484,41 +494,51 @@ func BuildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *l
 func buildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *lark.Webhook, text string, bot larkBotIdentity) sdk.InboundMessage {
 	senderID := larkSenderID(hook.Event.Sender.SenderID)
 	chat := hook.Event.Message.ChatIdentity(senderID)
+	return buildInboundMessageWithIdentity(workspaceUUID, channelUUID, accountUUID, hook, text, bot, chat, "")
+}
+
+func buildInboundMessageWithIdentity(workspaceUUID, channelUUID, accountUUID string, hook *lark.Webhook, text string, bot larkBotIdentity, chat lark.ChatIdentity, senderDisplayName string) sdk.InboundMessage {
 	mentions := larkMentionIdentities(hook.Event.Message.Mentions)
 	mentionAll := larkMentionsAll(hook.Event.Message.Mentions)
 	threadID := larkThreadID(hook.Event.Message)
 	return sdk.InboundMessage{
-		WorkspaceUUID: workspaceUUID,
-		Platform:      Platform,
-		AccountUUID:   accountUUID,
-		ChannelUUID:   channelUUID,
-		ChatType:      chat.ChatType,
-		ChatID:        chat.ChatID,
-		ThreadID:      threadID,
-		ChatIdentity:  larkSDKChatIdentity(chat),
-		SenderID:      chat.SenderID,
-		MessageID:     hook.Event.Message.MessageID,
-		Text:          text,
-		DedupeKey:     hook.DedupeKey(accountUUID),
-		Mentions:      mentions,
-		MentionedMe:   larkMentionsBot(mentions, bot),
-		MentionAll:    mentionAll,
+		WorkspaceUUID:     workspaceUUID,
+		Platform:          Platform,
+		AccountUUID:       accountUUID,
+		ChannelUUID:       channelUUID,
+		ChatType:          chat.ChatType,
+		ChatID:            chat.ChatID,
+		ThreadID:          threadID,
+		ChatDisplayName:   strings.TrimSpace(chat.DisplayName),
+		ChatAvatarURL:     strings.TrimSpace(chat.AvatarURL),
+		ChatIdentity:      larkSDKChatIdentity(chat),
+		SenderID:          chat.SenderID,
+		SenderDisplayName: strings.TrimSpace(senderDisplayName),
+		MessageID:         hook.Event.Message.MessageID,
+		Text:              text,
+		DedupeKey:         hook.DedupeKey(accountUUID),
+		Mentions:          mentions,
+		MentionedMe:       larkMentionsBot(mentions, bot),
+		MentionAll:        mentionAll,
 		Raw: map[string]any{
-			"event_id":      hook.EventID(),
-			"event_type":    hook.EventType(),
-			"app_id":        hook.Header.AppID,
-			"chat_id":       hook.Event.Message.ChatID,
-			"chat_type":     hook.Event.Message.ChatType,
-			"chat_identity": larkSDKChatIdentity(chat),
-			"message_id":    hook.Event.Message.MessageID,
-			"root_id":       hook.Event.Message.RootID,
-			"parent_id":     hook.Event.Message.ParentID,
-			"thread_id":     hook.Event.Message.ThreadID,
-			"message_type":  hook.Event.Message.MessageType,
-			"sender_id":     hook.Event.Sender.SenderID,
-			"create_time":   hook.Event.Message.CreateTime,
-			"mentions":      hook.Event.Message.Mentions,
-			"mention_all":   mentionAll,
+			"event_id":            hook.EventID(),
+			"event_type":          hook.EventType(),
+			"app_id":              hook.Header.AppID,
+			"chat_id":             hook.Event.Message.ChatID,
+			"chat_type":           hook.Event.Message.ChatType,
+			"chat_display_name":   strings.TrimSpace(chat.DisplayName),
+			"chat_avatar_url":     strings.TrimSpace(chat.AvatarURL),
+			"chat_identity":       larkSDKChatIdentity(chat),
+			"message_id":          hook.Event.Message.MessageID,
+			"root_id":             hook.Event.Message.RootID,
+			"parent_id":           hook.Event.Message.ParentID,
+			"thread_id":           hook.Event.Message.ThreadID,
+			"message_type":        hook.Event.Message.MessageType,
+			"sender_id":           hook.Event.Sender.SenderID,
+			"sender_display_name": strings.TrimSpace(senderDisplayName),
+			"create_time":         hook.Event.Message.CreateTime,
+			"mentions":            hook.Event.Message.Mentions,
+			"mention_all":         mentionAll,
 		},
 	}
 }
@@ -529,9 +549,11 @@ func larkThreadID(message lark.EventMessage) string {
 
 func larkSDKChatIdentity(chat lark.ChatIdentity) sdk.ChatIdentity {
 	return sdk.ChatIdentity{
-		ID:     strings.TrimSpace(chat.ChatID),
-		IDType: "chat_id",
-		Type:   strings.TrimSpace(chat.ChatType),
+		ID:          strings.TrimSpace(chat.ChatID),
+		IDType:      "chat_id",
+		Type:        strings.TrimSpace(chat.ChatType),
+		DisplayName: strings.TrimSpace(chat.DisplayName),
+		AvatarURL:   strings.TrimSpace(chat.AvatarURL),
 	}
 }
 
@@ -654,6 +676,81 @@ func ensureLarkBotIdentity(ctx context.Context, runtime sdk.Runtime, account sdk
 		return bot, err
 	}
 	return larkBotIdentityFromAccountState(account, accountState), nil
+}
+
+func resolveLarkDisplayNames(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, accountState *state.AccountState, chat *lark.ChatIdentity, sender lark.EventSender) string {
+	if accountState == nil || chat == nil {
+		return ""
+	}
+	accountState.EnsureMaps()
+	senderOpenID := strings.TrimSpace(sender.SenderID.OpenID)
+	senderID := strings.TrimSpace(chat.SenderID)
+	senderDisplayName := firstString(accountState.UserDisplayNames[senderID], accountState.UserDisplayNames[senderOpenID])
+	if chat.ChatID != "" {
+		chat.DisplayName = strings.TrimSpace(accountState.ChatDisplayNames[chat.ChatID])
+	}
+	if chat.DisplayName == "" && chat.ChatType == lark.ChatTypeDirect && senderDisplayName != "" {
+		chat.DisplayName = senderDisplayName
+		if chat.ChatID != "" {
+			accountState.ChatDisplayNames[chat.ChatID] = senderDisplayName
+		}
+	}
+	if senderDisplayName != "" && chat.DisplayName != "" {
+		return senderDisplayName
+	}
+	if runtime.HTTPClient == nil {
+		return senderDisplayName
+	}
+	client := clientFromAccount(runtime, account)
+	seedLarkClientToken(client, accountState)
+	defer captureLarkClientToken(client, accountState)
+	if senderDisplayName == "" && strings.EqualFold(strings.TrimSpace(sender.SenderType), "user") && senderOpenID != "" {
+		if info, err := client.UserInfo(ctx, senderOpenID); err == nil && info != nil {
+			if name := strings.TrimSpace(info.DisplayName()); name != "" {
+				senderDisplayName = name
+				accountState.UserDisplayNames[senderOpenID] = name
+				if senderID != "" {
+					accountState.UserDisplayNames[senderID] = name
+				}
+			}
+		}
+	}
+	if chat.DisplayName == "" && chat.ChatType == lark.ChatTypeDirect && senderDisplayName != "" {
+		chat.DisplayName = senderDisplayName
+		if chat.ChatID != "" {
+			accountState.ChatDisplayNames[chat.ChatID] = senderDisplayName
+		}
+	}
+	if chat.DisplayName == "" && chat.ChatType == lark.ChatTypeGroup && strings.TrimSpace(chat.ChatID) != "" {
+		if info, err := client.ChatInfo(ctx, chat.ChatID); err == nil && info != nil {
+			if name := strings.TrimSpace(info.DisplayName()); name != "" {
+				chat.DisplayName = name
+				accountState.ChatDisplayNames[chat.ChatID] = name
+			}
+			chat.AvatarURL = strings.TrimSpace(info.AvatarURL())
+		}
+	}
+	return senderDisplayName
+}
+
+func seedLarkClientToken(client *lark.Client, accountState *state.AccountState) {
+	if client == nil || accountState == nil {
+		return
+	}
+	if accountState.TenantAccessToken != "" && (accountState.TokenExpiresAt.IsZero() || accountState.TokenExpiresAt.After(time.Now().UTC().Add(5*time.Minute))) {
+		client.TenantToken = accountState.TenantAccessToken
+		client.TenantTokenExpiresAt = accountState.TokenExpiresAt
+	}
+}
+
+func captureLarkClientToken(client *lark.Client, accountState *state.AccountState) {
+	if client == nil || accountState == nil {
+		return
+	}
+	if strings.TrimSpace(client.TenantToken) != "" {
+		accountState.TenantAccessToken = client.TenantToken
+		accountState.TokenExpiresAt = client.TenantTokenExpiresAt
+	}
 }
 
 func larkSenderID(id lark.SenderID) string {
@@ -1203,6 +1300,8 @@ func sdkAccountToState(account sdk.ChannelAccount) state.AccountState {
 		BotUnionID:         firstString(account.Credential["bot_union_id"], account.State["bot_union_id"], standardBotIdentityValue(account.State, "union_id")),
 		ChannelLinkSession: stringValue(account.State["channel_link_session"]),
 		PeerSessions:       stringMap(account.State["peer_sessions"]),
+		UserDisplayNames:   stringMap(account.State["user_display_names"]),
+		ChatDisplayNames:   stringMap(account.State["chat_display_names"]),
 		InboundSeen:        stringMap(account.State["inbound_seen"]),
 		SentBeakMessages:   stringMap(account.State["sent_beak_messages"]),
 		StreamCursors:      stringMap(account.State["stream_cursors"]),
@@ -1222,6 +1321,8 @@ func accountStateToSDK(account state.AccountState, existing sdk.ChannelAccount) 
 	existing.State = map[string]any{
 		"channel_link_session":           account.ChannelLinkSession,
 		"peer_sessions":                  account.PeerSessions,
+		"user_display_names":             account.UserDisplayNames,
+		"chat_display_names":             account.ChatDisplayNames,
 		"inbound_seen":                   account.InboundSeen,
 		"sent_beak_messages":             account.SentBeakMessages,
 		"stream_cursors":                 account.StreamCursors,
