@@ -158,6 +158,7 @@ func TestClientBotInfoUsesTenantToken(t *testing.T) {
 func TestClientUserInfoAndChatInfo(t *testing.T) {
 	var sawUserInfo bool
 	var sawChatInfo bool
+	var sawChatMembers bool
 	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/open-apis/contact/v3/users/ou_user":
@@ -198,6 +199,29 @@ func TestClientUserInfoAndChatInfo(t *testing.T) {
 					"avatar_url": "https://example.test/team.png",
 				},
 			})
+		case "/open-apis/im/v1/chats/oc_group/members":
+			sawChatMembers = true
+			if r.Method != http.MethodGet {
+				t.Fatalf("members method=%s", r.Method)
+			}
+			if got := r.URL.Query().Get("member_id_type"); got != "open_id" {
+				t.Fatalf("member_id_type=%q", got)
+			}
+			if got := r.URL.Query().Get("page_size"); got != "50" {
+				t.Fatalf("page_size=%q", got)
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer cached-token" {
+				t.Fatalf("auth=%q", got)
+			}
+			return jsonResponse(map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{
+					"items": []map[string]any{
+						{"member_id": "ou_user", "member_id_type": "open_id", "name": "Alice Member"},
+					},
+				},
+			})
 		default:
 			t.Fatalf("unexpected request: %s", r.URL.Path)
 		}
@@ -214,14 +238,21 @@ func TestClientUserInfoAndChatInfo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !sawUserInfo || !sawChatInfo {
-		t.Fatalf("sawUserInfo=%v sawChatInfo=%v", sawUserInfo, sawChatInfo)
+	members, err := client.ChatMembers(context.Background(), "oc_group")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawUserInfo || !sawChatInfo || !sawChatMembers {
+		t.Fatalf("sawUserInfo=%v sawChatInfo=%v sawChatMembers=%v", sawUserInfo, sawChatInfo, sawChatMembers)
 	}
 	if userInfo.DisplayName() != "Alice" {
 		t.Fatalf("userInfo=%+v", userInfo)
 	}
 	if chatInfo.DisplayName() != "Team" || chatInfo.AvatarURL() != "https://example.test/team.png" {
 		t.Fatalf("chatInfo=%+v", chatInfo)
+	}
+	if members.DisplayNameForOpenID("ou_user") != "Alice Member" {
+		t.Fatalf("members=%+v", members)
 	}
 }
 

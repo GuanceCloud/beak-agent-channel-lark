@@ -113,6 +113,34 @@ func (r ChatInfoResponse) AvatarURL() string {
 	return firstNonEmptyString(r.Data.AvatarURL, r.Data.Avatar, r.Data.Chat.AvatarURL, r.Data.Chat.Avatar)
 }
 
+type ChatMembersResponse struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		Items []ChatMember `json:"items"`
+	} `json:"data"`
+}
+
+type ChatMember struct {
+	MemberID     string `json:"member_id"`
+	MemberIDType string `json:"member_id_type"`
+	Name         string `json:"name"`
+	TenantKey    string `json:"tenant_key"`
+}
+
+func (r ChatMembersResponse) DisplayNameForOpenID(openID string) string {
+	openID = strings.TrimSpace(openID)
+	if openID == "" {
+		return ""
+	}
+	for _, item := range r.Data.Items {
+		if strings.TrimSpace(item.MemberID) == openID {
+			return strings.TrimSpace(item.Name)
+		}
+	}
+	return ""
+}
+
 type Webhook struct {
 	Type      string
 	Token     string
