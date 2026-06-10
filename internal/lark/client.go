@@ -131,6 +131,28 @@ func (c *Client) ChatInfo(ctx context.Context, chatID string) (*ChatInfoResponse
 	return &resp, nil
 }
 
+func (c *Client) ChatMembers(ctx context.Context, chatID string) (*ChatMembersResponse, error) {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return nil, fmt.Errorf("chat_id is required")
+	}
+	token, err := c.tokenForRequest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var resp ChatMembersResponse
+	if err := c.doJSON(ctx, http.MethodGet, "/im/v1/chats/"+url.PathEscape(chatID)+"/members", map[string]string{
+		"member_id_type": "open_id",
+		"page_size":      "50",
+	}, nil, &resp, withBearer(token)); err != nil {
+		return nil, err
+	}
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("chat members failed: code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	return &resp, nil
+}
+
 func (c *Client) SendText(ctx context.Context, req SendTextRequest) (*SendTextResponse, error) {
 	if strings.TrimSpace(req.ReceiveID) == "" {
 		return nil, fmt.Errorf("receive_id is required")

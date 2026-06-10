@@ -575,7 +575,7 @@ func TestLarkConnectorHandleEventFetchesBotIdentity(t *testing.T) {
 				t.Fatalf("auth=%q", got)
 			}
 			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "bot": map[string]any{"open_id": "ou_bot_live", "app_name": "Beak Bot"}})
-		case "/open-apis/contact/v3/users/ou_user", "/open-apis/im/v1/chats/oc_group":
+		case "/open-apis/contact/v3/users/ou_user", "/open-apis/im/v1/chats/oc_group", "/open-apis/im/v1/chats/oc_group/members":
 			return testJSONResponse(map[string]any{"code": 99991663, "msg": "permission denied"})
 		default:
 			t.Fatalf("unexpected request: %s", req.URL.Path)
@@ -631,7 +631,7 @@ func TestLarkConnectorHandleEventMatchesBotNameForUserIDPostMention(t *testing.T
 		case "/open-apis/bot/v3/info":
 			sawBotInfo = true
 			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "bot": map[string]any{"open_id": "ou_bot", "app_name": "Beak Bot"}})
-		case "/open-apis/contact/v3/users/ou_user", "/open-apis/im/v1/chats/oc_group":
+		case "/open-apis/contact/v3/users/ou_user", "/open-apis/im/v1/chats/oc_group", "/open-apis/im/v1/chats/oc_group/members":
 			return testJSONResponse(map[string]any{"code": 99991663, "msg": "permission denied"})
 		default:
 			t.Fatalf("unexpected request: %s", req.URL.Path)
@@ -915,6 +915,76 @@ func TestLarkConnectorWebhookResolvesDisplayNames(t *testing.T) {
 	}
 }
 
+func TestLarkConnectorWebhookFallsBackToChatMembersForSenderName(t *testing.T) {
+	connector := newTestWebhookConnector(t)
+	gateway := &fakeSDKGateway{}
+	store := newFakeSDKAccountStore()
+	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	var sawUserInfo bool
+	var sawChatMembers bool
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "tenant-token", "expire": 7200})
+		case "/open-apis/contact/v3/users/ou_user":
+			sawUserInfo = true
+			return testJSONResponse(map[string]any{"code": 41050, "msg": "no user authority error"})
+		case "/open-apis/im/v1/chats/oc_group/members":
+			sawChatMembers = true
+			if got := req.URL.Query().Get("member_id_type"); got != "open_id" {
+				t.Fatalf("member_id_type=%q", got)
+			}
+			return testJSONResponse(map[string]any{
+				"code": 0,
+				"msg":  "success",
+				"data": map[string]any{
+					"items": []map[string]any{
+						{"member_id": "ou_user", "member_id_type": "open_id", "name": "Alice Member"},
+					},
+				},
+			})
+		case "/open-apis/im/v1/chats/oc_group":
+			return testJSONResponse(map[string]any{
+				"code": 0,
+				"msg":  "success",
+				"data": map[string]any{"chat_id": "oc_group", "name": "Team"},
+			})
+		default:
+			t.Fatalf("unexpected request: %s", req.URL.Path)
+		}
+		return nil, nil
+	})}
+	body := []byte(`{
+		"schema":"2.0",
+		"header":{"event_id":"evt_display_name_members","event_type":"im.message.receive_v1","app_id":"cli_1","token":"verify-token"},
+		"event":{
+			"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
+			"message":{"message_id":"om_display_name_members","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"hello member names\"}","create_time":"1770000000000"}
+		}
+	}`)
+	result, err := connector.HandleWebhook(context.Background(), sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+		AccountStore:  store,
+		HTTPClient:    httpClient,
+	}, account, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawUserInfo || !sawChatMembers {
+		t.Fatalf("sawUserInfo=%v sawChatMembers=%v", sawUserInfo, sawChatMembers)
+	}
+	if result.Inbound == nil || result.Inbound.SenderDisplayName != "Alice Member" || result.Inbound.ChatDisplayName != "Team" {
+		t.Fatalf("inbound=%+v", result.Inbound)
+	}
+	state := store.state("account-1")
+	if users, ok := state["user_display_names"].(map[string]string); !ok || users["ou_user"] != "Alice Member" {
+		t.Fatalf("user_display_names=%+v", state["user_display_names"])
+	}
+}
+
 func TestLarkConnectorWebhookIgnoresDisplayNameLookupFailure(t *testing.T) {
 	connector := newTestWebhookConnector(t)
 	gateway := &fakeSDKGateway{}
@@ -924,7 +994,7 @@ func TestLarkConnectorWebhookIgnoresDisplayNameLookupFailure(t *testing.T) {
 		switch req.URL.Path {
 		case "/open-apis/auth/v3/tenant_access_token/internal":
 			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "tenant-token", "expire": 7200})
-		case "/open-apis/contact/v3/users/ou_user", "/open-apis/im/v1/chats/oc_group":
+		case "/open-apis/contact/v3/users/ou_user", "/open-apis/im/v1/chats/oc_group", "/open-apis/im/v1/chats/oc_group/members":
 			return testJSONResponse(map[string]any{"code": 99991663, "msg": "permission denied"})
 		default:
 			t.Fatalf("unexpected request: %s", req.URL.Path)

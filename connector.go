@@ -698,15 +698,23 @@ func resolveLarkDisplayNames(ctx context.Context, runtime sdk.Runtime, account s
 	if senderDisplayName != "" && chat.DisplayName != "" {
 		return senderDisplayName
 	}
-	if runtime.HTTPClient == nil {
-		return senderDisplayName
-	}
 	client := clientFromAccount(runtime, account)
 	seedLarkClientToken(client, accountState)
 	defer captureLarkClientToken(client, accountState)
 	if senderDisplayName == "" && strings.EqualFold(strings.TrimSpace(sender.SenderType), "user") && senderOpenID != "" {
 		if info, err := client.UserInfo(ctx, senderOpenID); err == nil && info != nil {
 			if name := strings.TrimSpace(info.DisplayName()); name != "" {
+				senderDisplayName = name
+				accountState.UserDisplayNames[senderOpenID] = name
+				if senderID != "" {
+					accountState.UserDisplayNames[senderID] = name
+				}
+			}
+		}
+	}
+	if senderDisplayName == "" && chat.ChatType == lark.ChatTypeGroup && strings.TrimSpace(chat.ChatID) != "" && senderOpenID != "" {
+		if members, err := client.ChatMembers(ctx, chat.ChatID); err == nil && members != nil {
+			if name := strings.TrimSpace(members.DisplayNameForOpenID(senderOpenID)); name != "" {
 				senderDisplayName = name
 				accountState.UserDisplayNames[senderOpenID] = name
 				if senderID != "" {
