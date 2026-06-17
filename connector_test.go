@@ -1169,7 +1169,7 @@ func TestLarkOutboundMarkdownFormatAliases(t *testing.T) {
 	}
 }
 
-func TestLarkConnectorSendMarkdownTitleIgnoresMentionPrefix(t *testing.T) {
+func TestLarkConnectorSendMarkdownOmitsDerivedTitle(t *testing.T) {
 	httpClient := &http.Client{Transport: testRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/open-apis/auth/v3/tenant_access_token/internal":
@@ -1185,21 +1185,28 @@ func TestLarkConnectorSendMarkdownTitleIgnoresMentionPrefix(t *testing.T) {
 			if body.MsgType != "post" {
 				t.Fatalf("send body=%+v", body)
 			}
-			var content struct {
-				ZhCN struct {
-					Title   string `json:"title"`
-					Content [][]struct {
-						Text string `json:"text"`
-					} `json:"content"`
-				} `json:"zh_cn"`
-			}
+			var content map[string]map[string]any
 			if err := json.Unmarshal([]byte(body.Content), &content); err != nil {
 				t.Fatal(err)
 			}
-			if content.ZhCN.Title != "日志查询" {
-				t.Fatalf("title=%q", content.ZhCN.Title)
+			zhCN := content["zh_cn"]
+			if _, ok := zhCN["title"]; ok {
+				t.Fatalf("title should be omitted when not explicitly set: %+v", zhCN)
 			}
-			if got := content.ZhCN.Content[0][0].Text; !strings.HasPrefix(got, `<at user_id="all">Everyone</at>`) {
+			rows, ok := zhCN["content"].([]any)
+			if !ok || len(rows) != 1 {
+				t.Fatalf("content=%+v", zhCN["content"])
+			}
+			row, ok := rows[0].([]any)
+			if !ok || len(row) != 1 {
+				t.Fatalf("row=%+v", rows[0])
+			}
+			item, ok := row[0].(map[string]any)
+			if !ok {
+				t.Fatalf("item=%+v", row[0])
+			}
+			got, _ := item["text"].(string)
+			if !strings.HasPrefix(got, `<at user_id="all">Everyone</at>`) || !strings.Contains(got, "# 日志查询\n- 错误日志") {
 				t.Fatalf("markdown text=%q", got)
 			}
 			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"message_id": "om_markdown", "chat_id": "oc_group"}})

@@ -187,7 +187,7 @@ POST /open-apis/im/v1/messages?receive_id_type=<chat_id|open_id|union_id>
 
 群聊使用 `receive_id_type=chat_id`。单聊会根据 `ChatID` 推断 receive id type，通常 `oc_...` 使用 `chat_id`，`ou_...` 使用 `open_id`。
 
-设置 `OutboundMessage.Format="markdown"` 时，SDK 会把 agent 输出渲染成飞书/Lark `post` 消息，并使用 `md` element。`OutboundMessage.Title` 会作为 post title；未设置时 SDK 会从第一行非空 markdown 文本推导短标题。
+设置 `OutboundMessage.Format="markdown"` 时，SDK 会把 agent 输出渲染成飞书/Lark `post` 消息，并使用 `md` element。`OutboundMessage.Title` 会作为 post title；未设置时 SDK 不会从正文内容推导可见标题。
 
 普通 agent 文本或 markdown 出站时，Beak host 应该和其他 SDK 一样只传 `Text` / `Format` / `Title`，由飞书 SDK 把 markdown 映射成 Lark `post`。`Raw["msg_type"]` 和 `Raw["content"]` 只用于 host 已经构造好的平台原生 Lark payload。如果需要回复原消息，设置 `Raw["reply_to_message_id"]`，必要时设置 `Raw["reply_in_thread"]`。
 
