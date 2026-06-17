@@ -958,13 +958,16 @@ func larkMarkdownPostContent(req sdk.OutboundMessage) (string, error) {
 	if strings.TrimSpace(text) == "" {
 		return "", fmt.Errorf("text is required")
 	}
-	data, err := json.Marshal(map[string]any{
-		"zh_cn": map[string]any{
-			"title": larkOutboundTitle(req),
-			"content": [][]map[string]string{
-				{{"tag": "md", "text": text}},
-			},
+	zhCN := map[string]any{
+		"content": [][]map[string]string{
+			{{"tag": "md", "text": text}},
 		},
+	}
+	if title := larkOutboundTitle(req); title != "" {
+		zhCN["title"] = title
+	}
+	data, err := json.Marshal(map[string]any{
+		"zh_cn": zhCN,
 	})
 	if err != nil {
 		return "", err
@@ -976,25 +979,7 @@ func larkOutboundTitle(req sdk.OutboundMessage) string {
 	if title := strings.TrimSpace(firstString(req.Title, req.Raw["title"])); title != "" {
 		return title
 	}
-	return titleFromMarkdown(req.Text)
-}
-
-func titleFromMarkdown(text string) string {
-	for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		line = strings.TrimSpace(strings.TrimLeft(line, "#*>- \t"))
-		if line == "" {
-			continue
-		}
-		if len([]rune(line)) > 20 {
-			return string([]rune(line)[:20])
-		}
-		return line
-	}
-	return "Message"
+	return ""
 }
 
 func larkOutboundMentionText(req sdk.OutboundMessage) string {

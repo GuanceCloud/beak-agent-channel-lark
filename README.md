@@ -177,7 +177,7 @@ POST /open-apis/im/v1/messages?receive_id_type=<chat_id|open_id|union_id>
 
 For group chats, `receive_id_type=chat_id`. For direct chats, the SDK infers the receive id type from `ChatID`, usually `chat_id` for `oc_...` or `open_id` for `ou_...`.
 
-Set `OutboundMessage.Format="markdown"` to render agent output as a Feishu/Lark `post` message with an `md` element. `OutboundMessage.Title` is used as the post title; when omitted, the SDK derives a short title from the first non-empty markdown line.
+Set `OutboundMessage.Format="markdown"` to render agent output as a Feishu/Lark `post` message with an `md` element. `OutboundMessage.Title` is used as the post title; when omitted, the SDK does not derive a visible title from the message body.
 
 For normal agent text or markdown, Beak host should pass the same `Text` / `Format` / `Title` fields it passes to the other SDKs and let this SDK map markdown to Lark `post`. `Raw["msg_type"]` and `Raw["content"]` are only for already platform-native Lark payloads. For replies, set `Raw["reply_to_message_id"]`; optionally set `Raw["reply_in_thread"]`.
 
