@@ -59,6 +59,11 @@ type ReplyMessageRequest struct {
 	ReplyInThread *bool
 }
 
+type AddMessageReactionRequest struct {
+	MessageID string
+	EmojiType string
+}
+
 type SendTextResponse = SendMessageResponse
 
 type SendMessageResponse struct {
@@ -67,6 +72,22 @@ type SendMessageResponse struct {
 	Data struct {
 		MessageID string `json:"message_id"`
 		ChatID    string `json:"chat_id"`
+	} `json:"data"`
+}
+
+type MessageReactionResponse struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		ReactionID string `json:"reaction_id"`
+		Operator   struct {
+			OperatorID   string `json:"operator_id"`
+			OperatorType string `json:"operator_type"`
+		} `json:"operator"`
+		ActionTime   string `json:"action_time"`
+		ReactionType struct {
+			EmojiType string `json:"emoji_type"`
+		} `json:"reaction_type"`
 	} `json:"data"`
 }
 

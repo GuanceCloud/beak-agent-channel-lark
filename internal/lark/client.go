@@ -245,6 +245,33 @@ func (c *Client) ReplyMessage(ctx context.Context, req ReplyMessageRequest) (*Se
 	return &resp, nil
 }
 
+func (c *Client) AddMessageReaction(ctx context.Context, req AddMessageReactionRequest) (*MessageReactionResponse, error) {
+	if strings.TrimSpace(req.MessageID) == "" {
+		return nil, fmt.Errorf("message_id is required")
+	}
+	emojiType := strings.TrimSpace(req.EmojiType)
+	if emojiType == "" {
+		return nil, fmt.Errorf("emoji_type is required")
+	}
+	token, err := c.tokenForRequest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	body := map[string]any{
+		"reaction_type": map[string]any{
+			"emoji_type": emojiType,
+		},
+	}
+	var resp MessageReactionResponse
+	if err := c.doJSON(ctx, http.MethodPost, "/im/v1/messages/"+url.PathEscape(req.MessageID)+"/reactions", nil, body, &resp, withBearer(token)); err != nil {
+		return nil, err
+	}
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("add message reaction failed: code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	return &resp, nil
+}
+
 func (c *Client) tokenForRequest(ctx context.Context) (string, error) {
 	token := strings.TrimSpace(c.TenantToken)
 	if token != "" && (c.TenantTokenExpiresAt.IsZero() || c.TenantTokenExpiresAt.After(time.Now().UTC().Add(5*time.Minute))) {

@@ -13,6 +13,7 @@ This repository is importable library code. It is not a CLI, does not read user-
 - Host-backed credential and state persistence.
 - Text and `post` rich-text inbound `im.message.receive_v1` WebSocket events to Beak sessions.
 - Text or markdown-rendered Beak agent output back to Lark/Feishu through `im/v1/messages`.
+- Lightweight processing acknowledgement through message reaction with `Acknowledge` and `AckModes=["reaction"]`.
 - Raw outbound `msg_type`/`content` delivery for host-mapped Lark message types.
 - Optional reply delivery through `im/v1/messages/{message_id}/reply`.
 - Optional encrypted HTTP callback body decryption and request signature verification when `encrypt_key` is configured.
@@ -180,6 +181,31 @@ For group chats, `receive_id_type=chat_id`. For direct chats, the SDK infers the
 Set `OutboundMessage.Format="markdown"` to render agent output as a Feishu/Lark `post` message with an `md` element. `OutboundMessage.Title` is used as the post title; when omitted, the SDK does not derive a visible title from the message body.
 
 For normal agent text or markdown, Beak host should pass the same `Text` / `Format` / `Title` fields it passes to the other SDKs and let this SDK map markdown to Lark `post`. `Raw["msg_type"]` and `Raw["content"]` are only for already platform-native Lark payloads. For replies, set `Raw["reply_to_message_id"]`; optionally set `Raw["reply_in_thread"]`.
+
+## Lightweight Acknowledgement
+
+When agent processing may take time, Beak host can call `Acknowledge` immediately after the inbound message is accepted and before starting agent work:
+
+```go
+_, err := connector.Acknowledge(ctx, runtime, sdk.OutboundAck{
+	AccountUUID:     accountUUID,
+	ChatType:        sdk.ChatTypeGroup,
+	ChatID:          "oc_xxx",
+	TargetMessageID: inbound.MessageID,
+	Intent:          "processing",
+	Action:          "start",
+	Mode:            "reaction",
+	Emoji:           "thinking",
+})
+```
+
+The SDK maps this to:
+
+```text
+POST /open-apis/im/v1/messages/{message_id}/reactions
+```
+
+`TargetMessageID` must be the original Lark/Feishu message id. The SDK also accepts `Raw["message_id"]` for compatibility. If no target message id is available, it returns `Status="skipped"` with no error so the final agent reply path continues. `Action="stop"` is a no-op for reaction mode. The SDK never sends a normal text message as an acknowledgement fallback.
 
 ## Session Rules
 

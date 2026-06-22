@@ -41,6 +41,9 @@ func TestLarkConnectorMetadataAndSchema(t *testing.T) {
 	if !metadata.Capabilities.Stream || metadata.Capabilities.Webhook {
 		t.Fatalf("stream/webhook capabilities=%+v", metadata.Capabilities)
 	}
+	if len(metadata.Capabilities.AckModes) != 1 || metadata.Capabilities.AckModes[0] != "reaction" {
+		t.Fatalf("ack modes=%+v", metadata.Capabilities.AckModes)
+	}
 	if len(metadata.Capabilities.LoginModes) != 1 || metadata.Capabilities.LoginModes[0] != sdk.LoginModeCredential {
 		t.Fatalf("login modes=%+v", metadata.Capabilities.LoginModes)
 	}
@@ -1269,6 +1272,116 @@ func TestLarkConnectorSendPersistsTokenForEmptyState(t *testing.T) {
 	state := store.state("account-1")
 	if state["tenant_access_token"] != "tenant-empty-state" || state["tenant_access_token_expires_at"] == nil {
 		t.Fatalf("saved state=%+v", state)
+	}
+}
+
+func TestLarkConnectorAcknowledgeAddsReaction(t *testing.T) {
+	var tokenCalls int
+	var sawReaction bool
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			tokenCalls++
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "token-ack", "expire": 7200})
+		case "/open-apis/im/v1/messages/om_inbound/reactions":
+			sawReaction = true
+			if got := r.Header.Get("Authorization"); got != "Bearer token-ack" {
+				t.Fatalf("auth=%q", got)
+			}
+			var body struct {
+				ReactionType struct {
+					EmojiType string `json:"emoji_type"`
+				} `json:"reaction_type"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body.ReactionType.EmojiType != "THINKING" {
+				t.Fatalf("reaction body=%+v", body)
+			}
+			return testJSONResponse(map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{
+					"reaction_id": "reaction-1",
+					"reaction_type": map[string]any{
+						"emoji_type": "THINKING",
+					},
+					"action_time": "1770000000000",
+				},
+			})
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+		}
+		return nil, nil
+	})}
+	store := newFakeSDKAccountStore()
+	result, err := NewConnector().Acknowledge(context.Background(), sdk.Runtime{
+		HTTPClient:   httpClient,
+		Account:      sdkAccount("account-1", "cli_1", "secret_1", "https://open.feishu.test"),
+		AccountStore: store,
+	}, sdk.OutboundAck{
+		AccountUUID:     "account-1",
+		ChatType:        sdk.ChatTypeGroup,
+		ChatID:          "oc_group",
+		TargetMessageID: "om_inbound",
+		Intent:          "processing",
+		Action:          "start",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tokenCalls != 1 || !sawReaction {
+		t.Fatalf("tokenCalls=%d sawReaction=%v", tokenCalls, sawReaction)
+	}
+	if result.Status != "sent" || result.Mode != "reaction" || result.ReactionID != "reaction-1" || result.Raw["emoji_type"] != "THINKING" {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestLarkConnectorAcknowledgeSkipsWithoutTargetMessageID(t *testing.T) {
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Fatalf("unexpected request: %s", r.URL.Path)
+		return nil, nil
+	})}
+	result, err := NewConnector().Acknowledge(context.Background(), sdk.Runtime{
+		HTTPClient: httpClient,
+		Account:    sdkAccount("account-1", "cli_1", "secret_1", "https://open.feishu.test"),
+	}, sdk.OutboundAck{
+		AccountUUID: "account-1",
+		ChatType:    sdk.ChatTypeGroup,
+		ChatID:      "oc_group",
+		Action:      "start",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "skipped" || result.Mode != "reaction" || result.Raw["reason"] != "missing_target_message_id" {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestLarkConnectorAcknowledgeUnsupportedMode(t *testing.T) {
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Fatalf("unexpected request: %s", r.URL.Path)
+		return nil, nil
+	})}
+	result, err := NewConnector().Acknowledge(context.Background(), sdk.Runtime{
+		HTTPClient: httpClient,
+		Account:    sdkAccount("account-1", "cli_1", "secret_1", "https://open.feishu.test"),
+	}, sdk.OutboundAck{
+		AccountUUID:     "account-1",
+		ChatType:        sdk.ChatTypeGroup,
+		ChatID:          "oc_group",
+		TargetMessageID: "om_inbound",
+		Action:          "start",
+		Mode:            "typing",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "unsupported" || result.Mode != "typing" || result.Raw["reason"] != "unsupported_ack_mode" {
+		t.Fatalf("result=%+v", result)
 	}
 }
 

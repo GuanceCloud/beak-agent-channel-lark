@@ -71,6 +71,7 @@ func (c Connector) Metadata() sdk.ConnectorMetadata {
 			Stream:         true,
 			Webhook:        false,
 			BlockStreaming: caps.BlockStreaming,
+			AckModes:       []string{"reaction"},
 		},
 	}
 }
@@ -272,6 +273,75 @@ func (c Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.Outbou
 			"msg_type": msgType,
 		},
 	}, nil
+}
+
+func (c Connector) Acknowledge(ctx context.Context, runtime sdk.Runtime, req sdk.OutboundAck) (*sdk.AckResult, error) {
+	account, err := selectRuntimeAccount(runtime, req.AccountUUID)
+	if err != nil {
+		return nil, err
+	}
+	accountUUID := accountKey(account)
+	result := &sdk.AckResult{
+		Platform:    Platform,
+		AccountUUID: accountUUID,
+		Mode:        "reaction",
+		Status:      "skipped",
+	}
+	if mode := larkUnsupportedAckMode(req); mode != "" {
+		result.Mode = mode
+		result.Status = "unsupported"
+		result.Raw = map[string]any{"reason": "unsupported_ack_mode"}
+		return result, nil
+	}
+	if !larkAckWantsReaction(req) {
+		return result, nil
+	}
+	messageID := larkAckTargetMessageID(req)
+	if messageID == "" {
+		result.Raw = map[string]any{"reason": "missing_target_message_id"}
+		return result, nil
+	}
+
+	store := newConnectorStateStore(runtime.AccountStore)
+	store.seed(account)
+	accountState, err := store.LoadAccount(ctx, accountUUID)
+	if err != nil {
+		return nil, err
+	}
+	client := clientFromAccount(runtime, account)
+	now := time.Now().UTC()
+	if accountState.TenantAccessToken != "" && accountState.TokenExpiresAt.After(now.Add(5*time.Minute)) {
+		client.TenantToken = accountState.TenantAccessToken
+		client.TenantTokenExpiresAt = accountState.TokenExpiresAt
+	}
+	if client.TenantToken == "" || !client.TenantTokenExpiresAt.After(now.Add(5*time.Minute)) {
+		token, expiresAt, err := client.TenantAccessTokenWithExpiry(ctx, now)
+		if err != nil {
+			return nil, err
+		}
+		accountState.TenantAccessToken = token
+		accountState.TokenExpiresAt = expiresAt
+		if err := store.SaveAccount(ctx, accountState); err != nil {
+			return nil, err
+		}
+	}
+
+	emojiType := larkAckEmojiType(req)
+	resp, err := client.AddMessageReaction(ctx, lark.AddMessageReactionRequest{
+		MessageID: messageID,
+		EmojiType: emojiType,
+	})
+	if err != nil {
+		return nil, err
+	}
+	result.Status = "sent"
+	result.ReactionID = resp.Data.ReactionID
+	result.Raw = map[string]any{
+		"message_id":  messageID,
+		"emoji_type":  resp.Data.ReactionType.EmojiType,
+		"action_time": resp.Data.ActionTime,
+	}
+	return result, nil
 }
 
 func (Connector) Stop(context.Context, sdk.ChannelAccount) error {
@@ -892,6 +962,47 @@ func receiveIDType(req sdk.OutboundMessage) string {
 		return "chat_id"
 	}
 	return lark.ReceiveIDTypeForTarget(req.ChatID)
+}
+
+func larkAckWantsReaction(req sdk.OutboundAck) bool {
+	action := strings.ToLower(strings.TrimSpace(firstString(req.Action, req.Raw["action"])))
+	return action == "" || action == "start" || action == "processing"
+}
+
+func larkUnsupportedAckMode(req sdk.OutboundAck) string {
+	mode := strings.ToLower(strings.TrimSpace(firstString(req.Mode, req.Raw["mode"])))
+	if mode == "" || mode == "auto" || mode == "reaction" {
+		return ""
+	}
+	return mode
+}
+
+func larkAckTargetMessageID(req sdk.OutboundAck) string {
+	return firstString(req.TargetMessageID, req.Raw["target_message_id"], req.Raw["message_id"], req.Raw["lark_message_id"])
+}
+
+func larkAckEmojiType(req sdk.OutboundAck) string {
+	value := strings.TrimSpace(firstString(req.Emoji, req.Raw["emoji"], req.Raw["emoji_type"]))
+	switch strings.ToLower(value) {
+	case "", "thinking", "think", "processing":
+		return "THINKING"
+	case "typing":
+		return "Typing"
+	case "onit", "on_it", "on-it":
+		return "OnIt"
+	case "one_second", "one-second", "onesecond", "wait":
+		return "OneSecond"
+	case "ok":
+		return "OK"
+	case "done", "check", "checkmark", "check_mark":
+		return "DONE"
+	case "thumbsup", "thumbs_up", "thumbs-up", "+1":
+		return "THUMBSUP"
+	case "smile":
+		return "SMILE"
+	default:
+		return value
+	}
 }
 
 func outboundMsgType(req sdk.OutboundMessage) string {

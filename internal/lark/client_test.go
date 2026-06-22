@@ -315,6 +315,56 @@ func TestClientSendGenericAndReplyMessage(t *testing.T) {
 	}
 }
 
+func TestClientAddMessageReaction(t *testing.T) {
+	var sawReaction bool
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/open-apis/im/v1/messages/om_parent/reactions" {
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+		}
+		sawReaction = true
+		if r.Method != http.MethodPost {
+			t.Fatalf("reaction method=%s", r.Method)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer cached-token" {
+			t.Fatalf("auth=%q", got)
+		}
+		var body struct {
+			ReactionType struct {
+				EmojiType string `json:"emoji_type"`
+			} `json:"reaction_type"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body.ReactionType.EmojiType != "THINKING" {
+			t.Fatalf("reaction body=%+v", body)
+		}
+		return jsonResponse(map[string]any{
+			"code": 0,
+			"msg":  "ok",
+			"data": map[string]any{
+				"reaction_id": "reaction-1",
+				"reaction_type": map[string]any{
+					"emoji_type": "THINKING",
+				},
+			},
+		})
+	})}
+	client := NewClient("https://open.feishu.test", "cli_1", "secret_1")
+	client.HTTPClient = httpClient
+	client.TenantToken = "cached-token"
+	resp, err := client.AddMessageReaction(context.Background(), AddMessageReactionRequest{
+		MessageID: "om_parent",
+		EmojiType: "THINKING",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawReaction || resp.Data.ReactionID != "reaction-1" || resp.Data.ReactionType.EmojiType != "THINKING" {
+		t.Fatalf("sawReaction=%v resp=%+v", sawReaction, resp)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {

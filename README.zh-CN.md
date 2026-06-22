@@ -15,6 +15,7 @@ v1 支持：
 - 由 Beak host 保存 credential 和 connector state。
 - 文本和 `post` 富文本 `im.message.receive_v1` WebSocket 事件入站到 Beak session。
 - Beak agent 文本或 markdown 渲染输出通过 `im/v1/messages` 回发到飞书/Lark。
+- 通过 `Acknowledge` 和 `AckModes=["reaction"]` 提供处理中轻量确认，映射为消息 reaction。
 - 支持由 Beak host 映射的 raw outbound `msg_type` / `content`。
 - 支持通过 `im/v1/messages/{message_id}/reply` 回复原消息。
 - 配置 `encrypt_key` 后，兼容 HTTP callback 的加密 body 解密和请求签名校验。
@@ -190,6 +191,31 @@ POST /open-apis/im/v1/messages?receive_id_type=<chat_id|open_id|union_id>
 设置 `OutboundMessage.Format="markdown"` 时，SDK 会把 agent 输出渲染成飞书/Lark `post` 消息，并使用 `md` element。`OutboundMessage.Title` 会作为 post title；未设置时 SDK 不会从正文内容推导可见标题。
 
 普通 agent 文本或 markdown 出站时，Beak host 应该和其他 SDK 一样只传 `Text` / `Format` / `Title`，由飞书 SDK 把 markdown 映射成 Lark `post`。`Raw["msg_type"]` 和 `Raw["content"]` 只用于 host 已经构造好的平台原生 Lark payload。如果需要回复原消息，设置 `Raw["reply_to_message_id"]`，必要时设置 `Raw["reply_in_thread"]`。
+
+## 轻量确认 Acknowledge
+
+如果 Agent 处理可能耗时，Beak host 可以在入站消息被接受后、启动 Agent 前立即调用 `Acknowledge`：
+
+```go
+_, err := connector.Acknowledge(ctx, runtime, sdk.OutboundAck{
+	AccountUUID:     accountUUID,
+	ChatType:        sdk.ChatTypeGroup,
+	ChatID:          "oc_xxx",
+	TargetMessageID: inbound.MessageID,
+	Intent:          "processing",
+	Action:          "start",
+	Mode:            "reaction",
+	Emoji:           "thinking",
+})
+```
+
+SDK 会映射为：
+
+```text
+POST /open-apis/im/v1/messages/{message_id}/reactions
+```
+
+`TargetMessageID` 必须是飞书/Lark 原始 message id。SDK 也兼容读取 `Raw["message_id"]`。如果没有目标 message id，返回 `Status="skipped"` 且不报错，最终 Agent 回复链路继续执行。reaction 模式下 `Action="stop"` 是 no-op。SDK 不会用普通文本消息做 ACK fallback。
 
 ## Session 规则
 
