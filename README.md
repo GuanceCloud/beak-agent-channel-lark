@@ -258,11 +258,14 @@ Beak host stores account state. The SDK reads and writes through `sdk.AccountSto
 - `inbound_seen`: inbound dedupe keys.
 - `sent_beak_messages`: reserved outbound message dedupe state.
 - `stream_cursors`: reserved Beak stream cursors.
+- `stream_last_event_at` / `stream_last_activity_at`: standard runtime health timestamps written when `HandleEvent` successfully processes an event.
 - `tenant_access_token` / `tenant_access_token_expires_at`: tenant token cache for send APIs.
 - `bot_open_id`: bot identity used for self-echo filtering.
 - `bot_identity` / `bot_identities`: standard bot identity cache used by the unified SDK contract.
 
 `peer_sessions` must stay chat-scoped. Thread context is available through inbound metadata and `EnsureChatSessionRequest.ThreadID`; do not treat a Lark thread as a different SDK peer-session key unless Beak product requirements explicitly move to thread-level sessions.
+
+Lark WebSocket connection ownership stays in Beak host. The SDK does not own the WebSocket client, heartbeat, or reconnect loop; host WebSocket runtime should write connection and reconnect health, while the SDK writes event activity timestamps.
 
 ## Verification
 

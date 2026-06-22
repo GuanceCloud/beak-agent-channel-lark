@@ -12,24 +12,37 @@ const (
 )
 
 type AccountState struct {
-	AccountID          string            `json:"account_id"`
-	AppID              string            `json:"app_id,omitempty"`
-	BaseURL            string            `json:"base_url,omitempty"`
-	Brand              string            `json:"brand,omitempty"`
-	TenantAccessToken  string            `json:"tenant_access_token,omitempty"`
-	TokenExpiresAt     time.Time         `json:"tenant_access_token_expires_at,omitempty"`
-	BotOpenID          string            `json:"bot_open_id,omitempty"`
-	BotName            string            `json:"bot_name,omitempty"`
-	BotUserID          string            `json:"bot_user_id,omitempty"`
-	BotUnionID         string            `json:"bot_union_id,omitempty"`
-	ChannelLinkSession string            `json:"channel_link_session,omitempty"`
-	PeerSessions       map[string]string `json:"peer_sessions,omitempty"`
-	UserDisplayNames   map[string]string `json:"user_display_names,omitempty"`
-	ChatDisplayNames   map[string]string `json:"chat_display_names,omitempty"`
-	InboundSeen        map[string]string `json:"inbound_seen,omitempty"`
-	SentBeakMessages   map[string]string `json:"sent_beak_messages,omitempty"`
-	StreamCursors      map[string]string `json:"stream_cursors,omitempty"`
-	UpdatedAt          time.Time         `json:"updated_at"`
+	AccountID                  string            `json:"account_id"`
+	AppID                      string            `json:"app_id,omitempty"`
+	BaseURL                    string            `json:"base_url,omitempty"`
+	Brand                      string            `json:"brand,omitempty"`
+	TenantAccessToken          string            `json:"tenant_access_token,omitempty"`
+	TokenExpiresAt             time.Time         `json:"tenant_access_token_expires_at,omitempty"`
+	BotOpenID                  string            `json:"bot_open_id,omitempty"`
+	BotName                    string            `json:"bot_name,omitempty"`
+	BotUserID                  string            `json:"bot_user_id,omitempty"`
+	BotUnionID                 string            `json:"bot_union_id,omitempty"`
+	ChannelLinkSession         string            `json:"channel_link_session,omitempty"`
+	PeerSessions               map[string]string `json:"peer_sessions,omitempty"`
+	UserDisplayNames           map[string]string `json:"user_display_names,omitempty"`
+	ChatDisplayNames           map[string]string `json:"chat_display_names,omitempty"`
+	InboundSeen                map[string]string `json:"inbound_seen,omitempty"`
+	SentBeakMessages           map[string]string `json:"sent_beak_messages,omitempty"`
+	StreamCursors              map[string]string `json:"stream_cursors,omitempty"`
+	StreamConnectionState      string            `json:"stream_connection_state,omitempty"`
+	StreamConnectedAt          time.Time         `json:"stream_connected_at,omitempty"`
+	StreamDisconnectedAt       time.Time         `json:"stream_disconnected_at,omitempty"`
+	StreamLastActivityAt       time.Time         `json:"stream_last_activity_at,omitempty"`
+	StreamLastPingAt           time.Time         `json:"stream_last_ping_at,omitempty"`
+	StreamLastPongAt           time.Time         `json:"stream_last_pong_at,omitempty"`
+	StreamLastEventAt          time.Time         `json:"stream_last_event_at,omitempty"`
+	StreamLastError            string            `json:"stream_last_error,omitempty"`
+	StreamLastErrorAt          time.Time         `json:"stream_last_error_at,omitempty"`
+	StreamReconnectRequestedAt time.Time         `json:"stream_reconnect_requested_at,omitempty"`
+	StreamReconnectError       string            `json:"stream_reconnect_error,omitempty"`
+	StreamReconnectErrorAt     time.Time         `json:"stream_reconnect_error_at,omitempty"`
+	StreamSessionExpired       bool              `json:"stream_session_expired,omitempty"`
+	UpdatedAt                  time.Time         `json:"updated_at"`
 }
 
 func (a *AccountState) EnsureMaps() {
