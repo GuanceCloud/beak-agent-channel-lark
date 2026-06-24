@@ -58,7 +58,7 @@ func LarkConnector() sdk.Connector {
 }
 ```
 
-该 connector 同时实现 `beaklark.EventConnector`，用于 host-owned WebSocket event runtime：
+该 connector 实现通用 SDK `HostStreamConnector`，用于 host-owned WebSocket 传输；`beaklark.EventConnector` 仍保留给已解码 event payload 使用：
 
 ```go
 type EventConnector interface {
@@ -87,7 +87,7 @@ type WebhookRequestConnector interface {
 }
 ```
 
-OpenClaw 对齐的 WebSocket 主链路应 type assert `EventConnector`。只有 host 暴露 HTTP callback endpoint 时，才使用 `WebhookRequestConnector`；该路径返回平台 HTTP response，不返回 Beak 内部消息元数据。
+OpenClaw 对齐的 WebSocket 主链路应使用 SDK `HostStreamConnector`，让 endpoint 获取、frame codec、dispatcher response frame 和 event 解析都留在 SDK 内。只有 host 暴露 HTTP callback endpoint 时，才使用 `WebhookRequestConnector`；该路径返回平台 HTTP response，不返回 Beak 内部消息元数据。
 
 ## Credential Schema
 
@@ -126,23 +126,29 @@ runtime := sdk.Runtime{
 
 ## 事件处理
 
-OpenClaw 的 Lark 实现是 per-account WebSocket client，并在 Lark `EventDispatcher` 上注册 `im.message.receive_v1`。Beak host 应复用这个边界：host 持有 WebSocket 连接，加载对应 `channel_account` 后，把解码后的 event body 传给 SDK：
+OpenClaw 的 Lark 实现是 per-account WebSocket client，并在 Lark dispatcher 上注册 `im.message.receive_v1`。Beak host 只复用 transport ownership：host 持有 WebSocket dial/read/write/reconnect loop，而 endpoint 获取、frame codec、dispatcher response frame 和 event 解析都留在 SDK `HostStreamConnector` 内：
 
 ```go
 connector := beaklark.NewConnector()
 
-eventConnector, ok := connector.(beaklark.EventConnector)
+hostStream, ok := connector.(sdk.HostStreamConnector)
 if !ok {
-	return errors.New("lark connector does not handle events")
+	return errors.New("lark connector does not expose HostStreamConnector")
 }
 
-result, err := eventConnector.HandleEvent(ctx, runtime, account, eventBody)
+connectResult, err := hostStream.ConnectStream(ctx, runtime, account)
 if err != nil {
 	return err
 }
+frameResult, err := hostStream.HandleStreamFrame(ctx, runtime, account, sdk.StreamFrameRequest{
+	MessageType: sdk.StreamMessageTypeBinary,
+	Data:        frameBytes,
+	ServiceID:   connectResult.ServiceID,
+	State:       connectResult.State,
+})
 ```
 
-`HandleEvent` 支持：
+`HandleStreamFrame` 内部复用 `HandleEvent`。事件处理支持：
 
 - SDK-flattened WebSocket `im.message.receive_v1` 文本和 `post` 富文本事件。
 - host WebSocket runtime 已解码的事件；该路径的传输校验由 host 的 Lark `EventDispatcher` 负责。

@@ -48,7 +48,7 @@ func LarkConnector() sdk.Connector {
 }
 ```
 
-The connector also implements `beaklark.EventConnector` for host-owned WebSocket event runtimes:
+The connector implements the generic SDK `HostStreamConnector` for host-owned WebSocket transport. `beaklark.EventConnector` remains available for already-decoded event payloads:
 
 ```go
 type EventConnector interface {
@@ -77,7 +77,7 @@ type WebhookRequestConnector interface {
 }
 ```
 
-Beak host should use `EventConnector` for the OpenClaw-aligned WebSocket path. Use `WebhookRequestConnector` only when the host exposes an HTTP callback endpoint; that path returns the platform HTTP response, not Beak internal message metadata.
+Beak host should use SDK `HostStreamConnector` for the OpenClaw-aligned WebSocket path, so endpoint lookup, frame codec, dispatcher response frames, and event parsing stay inside the SDK. Use `WebhookRequestConnector` only when the host exposes an HTTP callback endpoint; that path returns the platform HTTP response, not Beak internal message metadata.
 
 ## Credential Schema
 
@@ -116,23 +116,29 @@ runtime := sdk.Runtime{
 
 ## Event Handling
 
-OpenClaw's Lark implementation uses a per-account WebSocket client and registers `im.message.receive_v1` with the Lark `EventDispatcher`. The Beak host should mirror that ownership: keep the WebSocket connection in the host runtime, load the target `channel_account`, and pass the decoded event body to the SDK:
+OpenClaw's Lark implementation uses a per-account WebSocket client and registers `im.message.receive_v1` with the Lark dispatcher. Beak host mirrors only the transport ownership: it keeps the WebSocket dial/read/write/reconnect loop, while endpoint lookup, frame codec, dispatcher response frames, and event parsing stay inside SDK `HostStreamConnector`:
 
 ```go
 connector := beaklark.NewConnector()
 
-eventConnector, ok := connector.(beaklark.EventConnector)
+hostStream, ok := connector.(sdk.HostStreamConnector)
 if !ok {
-	return errors.New("lark connector does not handle events")
+	return errors.New("lark connector does not expose HostStreamConnector")
 }
 
-result, err := eventConnector.HandleEvent(ctx, runtime, account, eventBody)
+connectResult, err := hostStream.ConnectStream(ctx, runtime, account)
 if err != nil {
 	return err
 }
+frameResult, err := hostStream.HandleStreamFrame(ctx, runtime, account, sdk.StreamFrameRequest{
+	MessageType: sdk.StreamMessageTypeBinary,
+	Data:        frameBytes,
+	ServiceID:   connectResult.ServiceID,
+	State:       connectResult.State,
+})
 ```
 
-`HandleEvent` supports:
+`HandleStreamFrame` reuses `HandleEvent` internally. Event handling supports:
 
 - SDK-flattened WebSocket `im.message.receive_v1` text and `post` events.
 - Already-decoded events from the host WebSocket runtime. The host's Lark `EventDispatcher` owns transport verification for this path.

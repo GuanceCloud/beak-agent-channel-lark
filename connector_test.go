@@ -24,6 +24,9 @@ func TestLarkConnectorMetadataAndSchema(t *testing.T) {
 	if _, ok := connector.(EventConnector); !ok {
 		t.Fatal("NewConnector should expose EventConnector for host-owned Lark WebSocket routing")
 	}
+	if _, ok := connector.(sdk.HostStreamConnector); !ok {
+		t.Fatal("NewConnector should expose HostStreamConnector for host-owned Lark WebSocket routing")
+	}
 	if _, ok := connector.(WebhookConnector); !ok {
 		t.Fatal("NewConnector should expose WebhookConnector for HTTP callback compatibility")
 	}
@@ -40,6 +43,9 @@ func TestLarkConnectorMetadataAndSchema(t *testing.T) {
 	}
 	if !metadata.Capabilities.Stream || metadata.Capabilities.Webhook {
 		t.Fatalf("stream/webhook capabilities=%+v", metadata.Capabilities)
+	}
+	if metadata.Capabilities.RuntimeOwnership != sdk.RuntimeOwnershipHostStream {
+		t.Fatalf("runtime ownership=%q, want %q", metadata.Capabilities.RuntimeOwnership, sdk.RuntimeOwnershipHostStream)
 	}
 	if len(metadata.Capabilities.AckModes) != 1 || metadata.Capabilities.AckModes[0] != "reaction" {
 		t.Fatalf("ack modes=%+v", metadata.Capabilities.AckModes)
