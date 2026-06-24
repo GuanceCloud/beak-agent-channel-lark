@@ -114,6 +114,7 @@ func (c Connector) handleLarkControlFrame(frame larkws.Frame, state *larkHostStr
 	var config larkws.ClientConfig
 	if err := json.Unmarshal(frame.Payload, &config); err == nil && config.PingInterval > 0 {
 		state.PingInterval = time.Duration(config.PingInterval) * time.Second
+		out.PingInterval = state.PingInterval
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	out.HealthUpdates[sdk.RuntimeHealthKeyStreamLastPongAt] = now
@@ -176,6 +177,11 @@ func (c Connector) handleLarkDataFrame(ctx context.Context, runtime sdk.Runtime,
 	}
 	out.ResponseFrames = append(out.ResponseFrames, sdk.StreamFrame{MessageType: sdk.StreamMessageTypeBinary, Data: outbound})
 	out.EventResult = larkStreamEventResult(handled)
+	if handled != nil && !handled.Ignored && strings.TrimSpace(handled.MessageUUID) != "" {
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		out.HealthUpdates[sdk.RuntimeHealthKeyStreamLastEventAt] = now
+		out.HealthUpdates[sdk.RuntimeHealthKeyStreamLastActivityAt] = now
+	}
 	return out, err
 }
 
