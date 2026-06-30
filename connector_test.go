@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/GuanceCloud/beak-agent-channel-lark/sdk"
+	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 )
 
 func TestLarkConnectorMetadataAndSchema(t *testing.T) {
@@ -206,7 +207,40 @@ func TestLarkConnectorStartEnsuresChannelLink(t *testing.T) {
 	if gateway.channelLinkAccountUUID != "account-1" {
 		t.Fatalf("channel link account=%q", gateway.channelLinkAccountUUID)
 	}
+	if gateway.channelLinkPlatform != Platform || gateway.channelLinkBridgeParticipantID != "bridge:lark" {
+		t.Fatalf("channel link platform=%q bridge=%q", gateway.channelLinkPlatform, gateway.channelLinkBridgeParticipantID)
+	}
 	if state := store.state("account-1"); state["channel_link_session"] != "link-account-1" {
+		t.Fatalf("state=%+v", state)
+	}
+}
+
+func TestLarkConnectorStartUsesCredentialPlatformForFeishuLink(t *testing.T) {
+	connector := NewConnector()
+	gateway := &fakeSDKGateway{}
+	store := newFakeSDKAccountStore()
+	account := sdkAccount("account-feishu", "cli_1", "secret_1", "")
+	account.Platform = ""
+	err := connector.Start(context.Background(), sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+		AccountStore:  store,
+	})
+	if err != nil {
+		t.Fatalf("Start error=%v", err)
+	}
+	if gateway.channelLinkAccountUUID != "account-feishu" {
+		t.Fatalf("channel link account=%q", gateway.channelLinkAccountUUID)
+	}
+	if gateway.channelPlatform != "feishu" {
+		t.Fatalf("channel platform=%q", gateway.channelPlatform)
+	}
+	if gateway.channelLinkPlatform != "feishu" || gateway.channelLinkBridgeParticipantID != "bridge:feishu" {
+		t.Fatalf("channel link platform=%q bridge=%q", gateway.channelLinkPlatform, gateway.channelLinkBridgeParticipantID)
+	}
+	if state := store.state("account-feishu"); state["channel_link_session"] != "link-account-feishu" {
 		t.Fatalf("state=%+v", state)
 	}
 }
@@ -1042,6 +1076,104 @@ func TestLarkConnectorWebhookIgnoresDisplayNameLookupFailure(t *testing.T) {
 	}
 }
 
+func TestLarkConnectorWebhookUsesRuntimePlatformForFeishu(t *testing.T) {
+	connector := newTestWebhookConnector(t)
+	gateway := &fakeSDKGateway{}
+	account := sdkAccount("account-feishu", "cli_1", "secret_1", "")
+	account.Platform = ""
+	account.State["user_display_names"] = map[string]string{"ou_user": "Alice"}
+	account.State["chat_display_names"] = map[string]string{"oc_group": "Team"}
+	body := []byte(`{
+		"schema":"2.0",
+		"header":{"event_id":"evt_feishu_platform","event_type":"im.message.receive_v1","app_id":"cli_1","token":"verify-token"},
+		"event":{
+			"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
+			"message":{"message_id":"om_feishu_platform","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"hello feishu\"}","create_time":"1770000000000"}
+		}
+	}`)
+
+	result, err := connector.HandleWebhook(context.Background(), sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-lark", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+	}, account, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Inbound == nil || result.Inbound.Platform != "feishu" {
+		t.Fatalf("inbound=%+v", result.Inbound)
+	}
+	gateway.mu.Lock()
+	defer gateway.mu.Unlock()
+	if len(gateway.chatSessions) != 1 {
+		t.Fatalf("chatSessions=%+v", gateway.chatSessions)
+	}
+	chatReq := gateway.chatSessions[0]
+	if chatReq.Platform != "feishu" || chatReq.BridgeParticipantID != "bridge:feishu" {
+		t.Fatalf("chatReq platform=%q bridge=%q", chatReq.Platform, chatReq.BridgeParticipantID)
+	}
+	if chatReq.Metadata["source"] != "feishu" || chatReq.Metadata["platform"] != "feishu" {
+		t.Fatalf("chatReq metadata=%+v", chatReq.Metadata)
+	}
+	if len(gateway.messages) != 1 {
+		t.Fatalf("messages=%+v", gateway.messages)
+	}
+	message := gateway.messages[0]
+	if message.SenderID != "im:feishu:group:oc_group:user:ou_user" {
+		t.Fatalf("sender_id=%q", message.SenderID)
+	}
+	if message.Metadata["source"] != "feishu" || message.Metadata["platform"] != "feishu" {
+		t.Fatalf("message metadata=%+v", message.Metadata)
+	}
+	inbound, ok := message.Metadata["inbound_message"].(sdk.InboundMessage)
+	if !ok || inbound.Platform != "feishu" {
+		t.Fatalf("metadata inbound=%+v metadata=%+v", inbound, message.Metadata)
+	}
+}
+
+func TestLarkHostStreamUsesCredentialPlatformForFeishuEvent(t *testing.T) {
+	connector, ok := NewConnector().(sdk.HostStreamConnector)
+	if !ok {
+		t.Fatal("NewConnector should expose HostStreamConnector")
+	}
+	gateway := &fakeSDKGateway{}
+	account := sdkAccount("account-stream-feishu", "cli_1", "secret_1", "")
+	account.Platform = ""
+	account.State["user_display_names"] = map[string]string{"ou_user": "Alice"}
+	account.State["chat_display_names"] = map[string]string{"oc_group": "Team"}
+
+	result, err := connector.HandleStreamFrame(context.Background(), sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-lark", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+	}, account, sdk.StreamFrameRequest{
+		MessageType: sdk.StreamMessageTypeBinary,
+		Data:        larkStreamEventFrameForTest(t, "feishu-stream-event"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || result.EventResult == nil || result.EventResult.Inbound == nil {
+		t.Fatalf("result=%+v", result)
+	}
+	if result.EventResult.Inbound.Platform != "feishu" {
+		t.Fatalf("inbound=%+v", result.EventResult.Inbound)
+	}
+	if len(result.ResponseFrames) != 1 || result.ResponseFrames[0].MessageType != sdk.StreamMessageTypeBinary {
+		t.Fatalf("response frames=%+v", result.ResponseFrames)
+	}
+	gateway.mu.Lock()
+	defer gateway.mu.Unlock()
+	if len(gateway.chatSessions) != 1 || gateway.chatSessions[0].Platform != "feishu" || gateway.chatSessions[0].BridgeParticipantID != "bridge:feishu" {
+		t.Fatalf("chatSessions=%+v", gateway.chatSessions)
+	}
+	if len(gateway.messages) != 1 || gateway.messages[0].SenderID != "im:feishu:group:oc_group:user:ou_user" {
+		t.Fatalf("messages=%+v", gateway.messages)
+	}
+}
+
 func TestLarkConnectorSendUsesRequestedAccount(t *testing.T) {
 	httpClient := &http.Client{Transport: testRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
@@ -1088,12 +1220,13 @@ func TestLarkConnectorSendUsesRequestedAccount(t *testing.T) {
 	})}
 
 	connector := NewConnector()
+	account1 := sdkAccount("account-1", "cli_1", "secret_1", "https://open.feishu.test")
+	account2 := sdkAccount("account-2", "cli_2", "secret_2", "https://open.feishu.test")
+	account2.Platform = ""
 	result, err := connector.Send(context.Background(), sdk.Runtime{
 		HTTPClient: httpClient,
-		Accounts: []sdk.ChannelAccount{
-			sdkAccount("account-1", "cli_1", "secret_1", "https://open.feishu.test"),
-			sdkAccount("account-2", "cli_2", "secret_2", "https://open.feishu.test"),
-		},
+		Channel:    sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Accounts:   []sdk.ChannelAccount{account1, account2},
 	}, sdk.OutboundMessage{
 		AccountUUID: "account-2",
 		ChatType:    sdk.ChatTypeGroup,
@@ -1104,7 +1237,7 @@ func TestLarkConnectorSendUsesRequestedAccount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.AccountUUID != "account-2" || result.Platform != Platform || result.MessageID != "om_reply" {
+	if result.AccountUUID != "account-2" || result.Platform != "feishu" || result.MessageID != "om_reply" {
 		t.Fatalf("result=%+v", result)
 	}
 }
@@ -1322,9 +1455,12 @@ func TestLarkConnectorAcknowledgeAddsReaction(t *testing.T) {
 		return nil, nil
 	})}
 	store := newFakeSDKAccountStore()
+	account := sdkAccount("account-1", "cli_1", "secret_1", "https://open.feishu.test")
+	account.Platform = ""
 	result, err := NewConnector().Acknowledge(context.Background(), sdk.Runtime{
 		HTTPClient:   httpClient,
-		Account:      sdkAccount("account-1", "cli_1", "secret_1", "https://open.feishu.test"),
+		Channel:      sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:      account,
 		AccountStore: store,
 	}, sdk.OutboundAck{
 		AccountUUID:     "account-1",
@@ -1340,7 +1476,7 @@ func TestLarkConnectorAcknowledgeAddsReaction(t *testing.T) {
 	if tokenCalls != 1 || !sawReaction {
 		t.Fatalf("tokenCalls=%d sawReaction=%v", tokenCalls, sawReaction)
 	}
-	if result.Status != "sent" || result.Mode != "reaction" || result.ReactionID != "reaction-1" || result.Raw["emoji_type"] != "THINKING" {
+	if result.Platform != "feishu" || result.Status != "sent" || result.Mode != "reaction" || result.ReactionID != "reaction-1" || result.Raw["emoji_type"] != "THINKING" {
 		t.Fatalf("result=%+v", result)
 	}
 }
@@ -1533,6 +1669,40 @@ func TestLarkConnectorSendReplyAndRawContent(t *testing.T) {
 	}
 }
 
+func larkStreamEventFrameForTest(t *testing.T, messageID string) []byte {
+	t.Helper()
+	payload := []byte(`{
+		"schema":"2.0",
+		"header":{"event_id":"evt_stream_feishu","event_type":"im.message.receive_v1","app_id":"cli_1","token":"verify-token"},
+		"event":{
+			"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
+			"message":{"message_id":"om_stream_feishu","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"hello from stream\"}","create_time":"1770000000000"}
+		}
+	}`)
+	frame := larkws.Frame{
+		Method: int32(larkws.FrameTypeData),
+		Headers: []larkws.Header{{
+			Key:   larkws.HeaderType,
+			Value: string(larkws.MessageTypeEvent),
+		}, {
+			Key:   larkws.HeaderMessageID,
+			Value: messageID,
+		}, {
+			Key:   larkws.HeaderSum,
+			Value: "1",
+		}, {
+			Key:   larkws.HeaderSeq,
+			Value: "0",
+		}},
+		Payload: payload,
+	}
+	data, err := frame.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
 func sdkAccount(uuid, appID, appSecret, baseURL string) sdk.ChannelAccount {
 	credential := map[string]any{
 		"account_id":         uuid,
@@ -1556,11 +1726,13 @@ func sdkAccount(uuid, appID, appSecret, baseURL string) sdk.ChannelAccount {
 }
 
 type fakeSDKGateway struct {
-	mu                     sync.Mutex
-	channelPlatform        string
-	channelLinkAccountUUID string
-	chatSessions           []sdk.EnsureChatSessionRequest
-	messages               []sdk.CreateMessageRequest
+	mu                             sync.Mutex
+	channelPlatform                string
+	channelLinkAccountUUID         string
+	channelLinkPlatform            string
+	channelLinkBridgeParticipantID string
+	chatSessions                   []sdk.EnsureChatSessionRequest
+	messages                       []sdk.CreateMessageRequest
 }
 
 func (g *fakeSDKGateway) EnsureChannel(ctx context.Context, req sdk.EnsureChannelRequest) (string, error) {
@@ -1574,6 +1746,8 @@ func (g *fakeSDKGateway) EnsureChannelLinkSession(ctx context.Context, req sdk.E
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.channelLinkAccountUUID = req.AccountUUID
+	g.channelLinkPlatform = req.Platform
+	g.channelLinkBridgeParticipantID = req.BridgeParticipantID
 	return "link-" + req.AccountUUID, nil
 }
 

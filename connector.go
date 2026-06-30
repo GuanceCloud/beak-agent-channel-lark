@@ -101,17 +101,18 @@ func (c Connector) CredentialSchema(context.Context) sdk.CredentialSchema {
 func (Connector) ValidateCredential(ctx context.Context, req sdk.CredentialValidationRequest) (*sdk.CredentialValidationResult, error) {
 	credential := cloneMap(req.Credential)
 	state := cloneMap(req.State)
+	platform := credentialValidationPlatform(req, credential)
 	client := lark.NewClient(baseURLFromCredential(credential), stringValue(credential["app_id"]), stringValue(credential["app_secret"]))
 	client.HTTPClient = req.Runtime.HTTPClient
 
 	now := time.Now().UTC()
 	token, expiresAt, err := client.TenantAccessTokenWithExpiry(ctx, now)
 	if err != nil {
-		return credentialValidationFailure(credential, state, err), nil
+		return credentialValidationFailure(credential, state, platform, err), nil
 	}
 	info, err := client.BotInfo(ctx)
 	if err != nil {
-		return credentialValidationFailure(credential, state, err), nil
+		return credentialValidationFailure(credential, state, platform, err), nil
 	}
 
 	accountKey := firstString(credential["account_id"], credential["app_id"])
@@ -144,7 +145,7 @@ func (Connector) ValidateCredential(ctx context.Context, req sdk.CredentialValid
 		Credential:  credential,
 		State:       state,
 		Metadata: map[string]any{
-			"platform":        Platform,
+			"platform":        platform,
 			"activate_status": info.Bot.ActivateStatus,
 			"avatar_url":      info.Bot.AvatarURL,
 			"ip_white_list":   info.Bot.IPWhiteList,
@@ -164,9 +165,10 @@ func (c Connector) Start(ctx context.Context, runtime sdk.Runtime) error {
 	if runtime.Gateway == nil {
 		return fmt.Errorf("lark connector requires sdk.Runtime.Gateway")
 	}
+	channelPlatform := effectiveChannelPlatform(runtime)
 	if _, err := runtime.Gateway.EnsureChannel(ctx, sdk.EnsureChannelRequest{
 		WorkspaceUUID: runtime.WorkspaceUUID,
-		Platform:      Platform,
+		Platform:      channelPlatform,
 		Name:          "Lark/Feishu",
 		Config:        map[string]any{"bridge": ID},
 	}); err != nil {
@@ -179,12 +181,13 @@ func (c Connector) Start(ctx context.Context, runtime sdk.Runtime) error {
 		if accountUUID == "" {
 			return fmt.Errorf("lark account_uuid or app_id is required")
 		}
+		accountPlatform := effectiveAccountPlatform(runtime, account)
 		sessionUUID, err := runtime.Gateway.EnsureChannelLinkSession(ctx, sdk.EnsureChannelLinkSessionRequest{
 			WorkspaceUUID:       runtime.WorkspaceUUID,
-			Platform:            Platform,
+			Platform:            accountPlatform,
 			AccountUUID:         accountUUID,
 			AgentParticipantID:  runtime.Gateway.AgentParticipantID(),
-			BridgeParticipantID: runtime.Gateway.BridgeParticipantID(Platform),
+			BridgeParticipantID: runtime.Gateway.BridgeParticipantID(accountPlatform),
 		})
 		if err != nil {
 			return err
@@ -212,6 +215,7 @@ func (c Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.Outbou
 		return nil, err
 	}
 	accountUUID := accountKey(account)
+	platform := effectiveAccountPlatform(runtime, account)
 	store := newConnectorStateStore(runtime.AccountStore)
 	store.seed(account)
 	accountState, err := store.LoadAccount(ctx, accountUUID)
@@ -266,7 +270,7 @@ func (c Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.Outbou
 		return nil, err
 	}
 	return &sdk.SendResult{
-		Platform:    Platform,
+		Platform:    platform,
 		AccountUUID: accountUUID,
 		MessageID:   resp.Data.MessageID,
 		Raw: map[string]any{
@@ -282,8 +286,9 @@ func (c Connector) Acknowledge(ctx context.Context, runtime sdk.Runtime, req sdk
 		return nil, err
 	}
 	accountUUID := accountKey(account)
+	platform := effectiveAccountPlatform(runtime, account)
 	result := &sdk.AckResult{
-		Platform:    Platform,
+		Platform:    platform,
 		AccountUUID: accountUUID,
 		Mode:        "reaction",
 		Status:      "skipped",
@@ -461,6 +466,7 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 	if accountUUID == "" {
 		return nil, fmt.Errorf("lark account_uuid or app_id is required")
 	}
+	platform := effectiveAccountPlatform(runtime, account)
 	store := newConnectorStateStore(runtime.AccountStore)
 	store.seed(account)
 	state, err := store.LoadAccount(ctx, accountUUID)
@@ -479,7 +485,7 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 		return larkMentionMatchesBot(mention, bot)
 	})
 	chat := hook.Event.Message.ChatIdentity(senderID)
-	inbound := buildInboundMessage(runtime.WorkspaceUUID, runtime.Channel.UUID, accountUUID, hook, text, bot)
+	inbound := buildInboundMessageForPlatform(platform, runtime.WorkspaceUUID, runtime.Channel.UUID, accountUUID, hook, text, bot)
 	if chat.ChatType == "" || chat.ChatID == "" || chat.SenderID == "" {
 		return &WebhookResult{Type: hook.EventType(), Ignored: true, Reason: "incomplete_or_non_text_message"}, nil
 	}
@@ -493,11 +499,11 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 		return &WebhookResult{Type: hook.EventType(), Ignored: true, Reason: "duplicate", SessionUUID: state.PeerSessions[stateKey]}, nil
 	}
 	senderDisplayName := resolveLarkDisplayNames(ctx, runtime, account, state, &chat, hook.Event.Sender)
-	inbound = buildInboundMessageWithIdentity(runtime.WorkspaceUUID, runtime.Channel.UUID, accountUUID, hook, text, bot, chat, senderDisplayName)
+	inbound = buildInboundMessageWithIdentityForPlatform(platform, runtime.WorkspaceUUID, runtime.Channel.UUID, accountUUID, hook, text, bot, chat, senderDisplayName)
 
 	sessionUUID, err := runtime.Gateway.EnsureChatSession(ctx, sdk.EnsureChatSessionRequest{
 		WorkspaceUUID:       runtime.WorkspaceUUID,
-		Platform:            Platform,
+		Platform:            platform,
 		AccountUUID:         accountUUID,
 		ChatType:            chat.ChatType,
 		ChatID:              chat.ChatID,
@@ -507,9 +513,10 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 		ChatIdentity:        larkSDKChatIdentity(chat),
 		SenderID:            chat.SenderID,
 		AgentParticipantID:  runtime.Gateway.AgentParticipantID(),
-		BridgeParticipantID: runtime.Gateway.BridgeParticipantID(Platform),
+		BridgeParticipantID: runtime.Gateway.BridgeParticipantID(platform),
 		Metadata: map[string]any{
-			"source":            Platform,
+			"source":            platform,
+			"platform":          platform,
 			"account_uuid":      accountUUID,
 			"chat_display_name": strings.TrimSpace(chat.DisplayName),
 			"chat_avatar_url":   strings.TrimSpace(chat.AvatarURL),
@@ -523,12 +530,12 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 	messageUUID, err := runtime.Gateway.CreateMessage(ctx, sdk.CreateMessageRequest{
 		WorkspaceUUID: runtime.WorkspaceUUID,
 		SessionUUID:   sessionUUID,
-		SenderID:      sdk.IMPersonParticipantID(Platform, chat.ChatType, chat.ChatID, chat.SenderID),
+		SenderID:      sdk.IMPersonParticipantID(platform, chat.ChatType, chat.ChatID, chat.SenderID),
 		Content:       text,
 		DedupeKey:     key,
 		Metadata: map[string]any{
-			"source":              Platform,
-			"platform":            Platform,
+			"source":              platform,
+			"platform":            platform,
 			"account_uuid":        accountUUID,
 			"lark_account_id":     accountUUID,
 			"lark_app_id":         stringValue(account.Credential["app_id"]),
@@ -566,18 +573,27 @@ func BuildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *l
 }
 
 func buildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *lark.Webhook, text string, bot larkBotIdentity) sdk.InboundMessage {
+	return buildInboundMessageForPlatform(Platform, workspaceUUID, channelUUID, accountUUID, hook, text, bot)
+}
+
+func buildInboundMessageForPlatform(platform, workspaceUUID, channelUUID, accountUUID string, hook *lark.Webhook, text string, bot larkBotIdentity) sdk.InboundMessage {
 	senderID := larkSenderID(hook.Event.Sender.SenderID)
 	chat := hook.Event.Message.ChatIdentity(senderID)
-	return buildInboundMessageWithIdentity(workspaceUUID, channelUUID, accountUUID, hook, text, bot, chat, "")
+	return buildInboundMessageWithIdentityForPlatform(platform, workspaceUUID, channelUUID, accountUUID, hook, text, bot, chat, "")
 }
 
 func buildInboundMessageWithIdentity(workspaceUUID, channelUUID, accountUUID string, hook *lark.Webhook, text string, bot larkBotIdentity, chat lark.ChatIdentity, senderDisplayName string) sdk.InboundMessage {
+	return buildInboundMessageWithIdentityForPlatform(Platform, workspaceUUID, channelUUID, accountUUID, hook, text, bot, chat, senderDisplayName)
+}
+
+func buildInboundMessageWithIdentityForPlatform(platform, workspaceUUID, channelUUID, accountUUID string, hook *lark.Webhook, text string, bot larkBotIdentity, chat lark.ChatIdentity, senderDisplayName string) sdk.InboundMessage {
 	mentions := larkMentionIdentities(hook.Event.Message.Mentions)
 	mentionAll := larkMentionsAll(hook.Event.Message.Mentions)
 	threadID := larkThreadID(hook.Event.Message)
+	platform = firstString(platform, Platform)
 	return sdk.InboundMessage{
 		WorkspaceUUID:     workspaceUUID,
-		Platform:          Platform,
+		Platform:          platform,
 		AccountUUID:       accountUUID,
 		ChannelUUID:       channelUUID,
 		ChatType:          chat.ChatType,
@@ -951,6 +967,57 @@ func clientFromAccount(runtime sdk.Runtime, account sdk.ChannelAccount) *lark.Cl
 	return client
 }
 
+func effectiveChannelPlatform(runtime sdk.Runtime) string {
+	if platform := firstString(
+		runtime.Account.Platform,
+		credentialPlatform(runtime.Account.Credential),
+	); platform != "" {
+		return platform
+	}
+	for _, account := range runtime.Accounts {
+		if platform := firstString(account.Platform, credentialPlatform(account.Credential)); platform != "" {
+			return platform
+		}
+	}
+	return firstString(runtime.Channel.Platform, Platform)
+}
+
+func effectiveAccountPlatform(runtime sdk.Runtime, account sdk.ChannelAccount) string {
+	return firstString(
+		account.Platform,
+		credentialPlatform(account.Credential),
+		runtime.Account.Platform,
+		credentialPlatform(runtime.Account.Credential),
+		runtime.Channel.Platform,
+		Platform,
+	)
+}
+
+func credentialValidationPlatform(req sdk.CredentialValidationRequest, credential map[string]any) string {
+	return firstString(req.Platform, credentialPlatform(credential), Platform)
+}
+
+func credentialPlatform(credential map[string]any) string {
+	if platform := strings.TrimSpace(stringValue(credential["platform"])); platform != "" {
+		return platform
+	}
+	switch strings.ToLower(strings.TrimSpace(stringValue(credential["brand"]))) {
+	case "feishu":
+		return "feishu"
+	case "lark":
+		return "lark"
+	}
+	baseURL := strings.ToLower(strings.TrimSpace(stringValue(credential["base_url"])))
+	switch {
+	case strings.Contains(baseURL, "open.feishu.cn"):
+		return "feishu"
+	case strings.Contains(baseURL, "open.larksuite.com"):
+		return "lark"
+	default:
+		return ""
+	}
+}
+
 func baseURLFromCredential(credential map[string]any) string {
 	if strings.EqualFold(strings.TrimSpace(stringValue(credential["brand"])), "lark") {
 		return lark.DefaultLarkBaseURL
@@ -1273,7 +1340,7 @@ func cloneMap(value map[string]any) map[string]any {
 	return out
 }
 
-func credentialValidationFailure(credential, state map[string]any, err error) *sdk.CredentialValidationResult {
+func credentialValidationFailure(credential, state map[string]any, platform string, err error) *sdk.CredentialValidationResult {
 	message := ""
 	if err != nil {
 		message = err.Error()
@@ -1284,7 +1351,7 @@ func credentialValidationFailure(credential, state map[string]any, err error) *s
 		DisplayName: firstString(credential["display_name"], credential["bot_name"], credential["app_id"]),
 		Credential:  credential,
 		State:       state,
-		Metadata:    map[string]any{"platform": Platform},
+		Metadata:    map[string]any{"platform": firstString(platform, Platform)},
 		Error:       message,
 	}
 }
@@ -1435,7 +1502,9 @@ func accountStateToSDK(account state.AccountState, existing sdk.ChannelAccount) 
 	if existing.UUID == "" {
 		existing.UUID = account.AccountID
 	}
-	existing.Platform = Platform
+	if strings.TrimSpace(existing.Platform) == "" {
+		existing.Platform = firstString(credentialPlatform(existing.Credential), credentialPlatform(map[string]any{"brand": account.Brand, "base_url": account.BaseURL}), Platform)
+	}
 	if existing.Credential == nil {
 		existing.Credential = map[string]any{}
 	}
