@@ -543,6 +543,56 @@ func TestMessageResponseAcceptsStringMentionIDAndPostText(t *testing.T) {
 	}
 }
 
+func TestMessageResponsePostTextUnwrapsNestedContentString(t *testing.T) {
+	nestedContent := `{"zh_cn":{"content":[[{"tag":"md","text":"**分析结果**\n\n1. 服务异常\n2. Trace ID 缺失"}]]}}`
+	payload, err := json.Marshal(map[string]any{
+		"code": 0,
+		"msg":  "ok",
+		"data": map[string]any{
+			"items": []map[string]any{{
+				"message_id": "om_parent",
+				"chat_id":    "oc_group",
+				"chat_type":  "group",
+				"msg_type":   "post",
+				"content":    map[string]any{"content": nestedContent},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp MessageResponse
+	if err := json.Unmarshal(payload, &resp); err != nil {
+		t.Fatal(err)
+	}
+	item := resp.FirstMessage()
+	if item == nil {
+		t.Fatal("missing first message")
+	}
+	want := "**分析结果**\n\n1. 服务异常\n2. Trace ID 缺失"
+	if got := item.EventMessage().Text(); got != want {
+		t.Fatalf("text=%q want=%q", got, want)
+	}
+}
+
+func TestEventMessagePostTextRendersContentArrayEnvelope(t *testing.T) {
+	msg := EventMessage{
+		MessageType: "post",
+		Content: `{
+			"content":[
+				[
+					{"tag":"text","text":"引用正文 "},
+					{"tag":"a","text":"详情","href":"https://example.test/detail"}
+				]
+			]
+		}`,
+	}
+	want := "引用正文 [详情](https://example.test/detail)"
+	if got := msg.Text(); got != want {
+		t.Fatalf("text=%q want=%q", got, want)
+	}
+}
+
 func TestEventMessagePostTextMatchesMentionUserID(t *testing.T) {
 	msg := EventMessage{
 		MessageType: "post",

@@ -1,6 +1,7 @@
 package lark
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -125,6 +126,41 @@ type MessageItem struct {
 	Mentions       []Mention   `json:"mentions"`
 }
 
+func (m *MessageItem) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		MessageID      string          `json:"message_id"`
+		RootID         string          `json:"root_id"`
+		ParentID       string          `json:"parent_id"`
+		ThreadID       string          `json:"thread_id"`
+		ChatID         string          `json:"chat_id"`
+		ChatType       string          `json:"chat_type"`
+		MessageType    string          `json:"msg_type"`
+		MessageTypeAlt string          `json:"message_type"`
+		Content        json.RawMessage `json:"content"`
+		CreateTime     string          `json:"create_time"`
+		Sender         EventSender     `json:"sender"`
+		Mentions       []Mention       `json:"mentions"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*m = MessageItem{
+		MessageID:      raw.MessageID,
+		RootID:         raw.RootID,
+		ParentID:       raw.ParentID,
+		ThreadID:       raw.ThreadID,
+		ChatID:         raw.ChatID,
+		ChatType:       raw.ChatType,
+		MessageType:    raw.MessageType,
+		MessageTypeAlt: raw.MessageTypeAlt,
+		Content:        rawMessageString(raw.Content),
+		CreateTime:     raw.CreateTime,
+		Sender:         raw.Sender,
+		Mentions:       raw.Mentions,
+	}
+	return nil
+}
+
 func (m MessageItem) EventMessage() EventMessage {
 	return EventMessage{
 		MessageID:   m.MessageID,
@@ -138,6 +174,18 @@ func (m MessageItem) EventMessage() EventMessage {
 		CreateTime:  m.CreateTime,
 		Mentions:    m.Mentions,
 	}
+}
+
+func rawMessageString(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return ""
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return text
+	}
+	return string(raw)
 }
 
 type UserInfoResponse struct {
@@ -424,33 +472,97 @@ func (m EventMessage) TextWithMentionFilter(strip func(Mention) bool) string {
 }
 
 func postContentText(raw string, mentions []Mention, strip func(Mention) bool) string {
-	var parsed map[string]any
+	var parsed any
 	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
-		return ""
+		return strings.TrimSpace(raw)
 	}
 	body := unwrapPostLocale(parsed)
 	if body == nil {
-		return ""
+		return strings.TrimSpace(renderPostContentValue(parsed, mentions, strip))
 	}
+	return renderPostBody(body, mentions, strip)
+}
+
+func renderPostBody(body map[string]any, mentions []Mention, strip func(Mention) bool) string {
 	var lines []string
 	if title := strings.TrimSpace(anyString(body["title"])); title != "" {
 		lines = append(lines, "**"+title+"**", "")
 	}
 	for _, paragraph := range anySlice(body["content"]) {
 		var line strings.Builder
-		for _, item := range anySlice(paragraph) {
-			line.WriteString(renderPostElement(item, mentions, strip))
+		if items := anySlice(paragraph); len(items) > 0 {
+			for _, item := range items {
+				line.WriteString(renderPostContentValue(item, mentions, strip))
+			}
+		} else {
+			line.WriteString(renderPostContentValue(paragraph, mentions, strip))
 		}
 		lines = append(lines, strings.TrimSpace(line.String()))
 	}
 	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
-func unwrapPostLocale(parsed map[string]any) map[string]any {
+func renderPostContentValue(value any, mentions []Mention, strip func(Mention) bool) string {
+	switch item := value.(type) {
+	case nil:
+		return ""
+	case string:
+		text := strings.TrimSpace(item)
+		if text == "" {
+			return ""
+		}
+		var nested any
+		if err := json.Unmarshal([]byte(text), &nested); err == nil {
+			if rendered := strings.TrimSpace(renderPostContentValue(nested, mentions, strip)); rendered != "" {
+				return rendered
+			}
+		}
+		return text
+	case []any:
+		var lines []string
+		for _, child := range item {
+			if text := strings.TrimSpace(renderPostContentValue(child, mentions, strip)); text != "" {
+				lines = append(lines, text)
+			}
+		}
+		return strings.Join(lines, "\n")
+	case map[string]any:
+		if tag := strings.TrimSpace(anyString(item["tag"])); tag != "" {
+			return renderPostElement(item, mentions, strip)
+		}
+		if body := unwrapPostLocale(item); body != nil {
+			return renderPostBody(body, mentions, strip)
+		}
+		for _, key := range []string{"content", "text", "plain_text", "fallback", "summary"} {
+			if text := strings.TrimSpace(renderPostContentValue(item[key], mentions, strip)); text != "" {
+				return text
+			}
+		}
+		return ""
+	default:
+		return ""
+	}
+}
+
+func unwrapPostLocale(parsed any) map[string]any {
 	return unwrapPostLocaleDepth(parsed, 0)
 }
 
-func unwrapPostLocaleDepth(parsed map[string]any, depth int) map[string]any {
+func unwrapPostLocaleDepth(value any, depth int) map[string]any {
+	parsed, ok := value.(map[string]any)
+	if !ok {
+		if text, ok := value.(string); ok {
+			text = strings.TrimSpace(text)
+			if text == "" {
+				return nil
+			}
+			var nested any
+			if err := json.Unmarshal([]byte(text), &nested); err == nil {
+				return unwrapPostLocaleDepth(nested, depth+1)
+			}
+		}
+		return nil
+	}
 	if parsed == nil || depth > 4 {
 		return nil
 	}
@@ -463,6 +575,11 @@ func unwrapPostLocaleDepth(parsed map[string]any, depth int) map[string]any {
 		}
 	}
 	if content, ok := parsed["content"].(map[string]any); ok {
+		if body := unwrapPostLocaleDepth(content, depth+1); body != nil {
+			return body
+		}
+	}
+	if content, ok := parsed["content"].(string); ok {
 		if body := unwrapPostLocaleDepth(content, depth+1); body != nil {
 			return body
 		}
