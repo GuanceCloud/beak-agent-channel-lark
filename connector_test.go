@@ -811,6 +811,40 @@ func TestLarkConnectorWebhookThreadIDPropagates(t *testing.T) {
 	gateway := &fakeSDKGateway{}
 	store := newFakeSDKAccountStore()
 	account := sdkAccount("account-1", "cli_1", "secret_1", "")
+	var sawReferencedMessage bool
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "tenant-token", "expire": 7200})
+		case "/open-apis/contact/v3/users/ou_user":
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"user": map[string]any{"open_id": "ou_user", "name": "Alice"}}})
+		case "/open-apis/im/v1/chats/oc_group":
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"chat_id": "oc_group", "name": "Team"}})
+		case "/open-apis/im/v1/messages/om_parent":
+			sawReferencedMessage = true
+			if got := req.URL.Query().Get("card_msg_content_type"); got != "raw_card_content" {
+				t.Fatalf("card_msg_content_type=%q", got)
+			}
+			return testJSONResponse(map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{
+					"items": []map[string]any{{
+						"message_id":  "om_parent",
+						"chat_id":     "oc_group",
+						"chat_type":   "group",
+						"msg_type":    "text",
+						"content":     `{"text":"quoted body"}`,
+						"create_time": "1760000000000",
+						"sender":      map[string]any{"sender_id": map[string]any{"open_id": "ou_parent"}, "sender_type": "user"},
+					}},
+				},
+			})
+		default:
+			t.Fatalf("unexpected request: %s", req.URL.Path)
+		}
+		return nil, nil
+	})}
 	body := []byte(`{
 		"schema":"2.0",
 		"header":{"event_id":"evt_thread","event_type":"im.message.receive_v1","app_id":"cli_1","token":"verify-token"},
@@ -825,6 +859,7 @@ func TestLarkConnectorWebhookThreadIDPropagates(t *testing.T) {
 		Account:       account,
 		Gateway:       gateway,
 		AccountStore:  store,
+		HTTPClient:    httpClient,
 	}, account, body)
 	if err != nil {
 		t.Fatal(err)
@@ -834,6 +869,12 @@ func TestLarkConnectorWebhookThreadIDPropagates(t *testing.T) {
 	}
 	if result.Inbound.ChatIdentity.ID != "oc_group" || result.Inbound.ChatIdentity.Type != sdk.ChatTypeGroup {
 		t.Fatalf("chat identity=%+v", result.Inbound.ChatIdentity)
+	}
+	if !sawReferencedMessage {
+		t.Fatal("referenced message endpoint was not called")
+	}
+	if result.Inbound.ReferencedMessage == nil || result.Inbound.ReferencedMessage.MessageID != "om_parent" || result.Inbound.ReferencedMessage.Text != "quoted body" || result.Inbound.ReferencedMessage.SenderID != "ou_parent" {
+		t.Fatalf("referenced_message=%+v", result.Inbound.ReferencedMessage)
 	}
 	gateway.mu.Lock()
 	defer gateway.mu.Unlock()
@@ -846,6 +887,9 @@ func TestLarkConnectorWebhookThreadIDPropagates(t *testing.T) {
 	inbound, ok := gateway.messages[0].Metadata["inbound_message"].(sdk.InboundMessage)
 	if !ok || inbound.ThreadID != "omt_thread" {
 		t.Fatalf("metadata inbound=%+v metadata=%+v", inbound, gateway.messages[0].Metadata)
+	}
+	if inbound.ReferencedMessage == nil || inbound.ReferencedMessage.MessageID != "om_parent" || inbound.ReferencedMessage.Text != "quoted body" {
+		t.Fatalf("metadata referenced_message=%+v metadata=%+v", inbound.ReferencedMessage, gateway.messages[0].Metadata)
 	}
 	if inbound.ChatIdentity.ID != "oc_group" || inbound.ChatIdentity.Type != sdk.ChatTypeGroup {
 		t.Fatalf("metadata inbound identity=%+v", inbound.ChatIdentity)

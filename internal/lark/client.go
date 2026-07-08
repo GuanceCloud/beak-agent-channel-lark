@@ -153,6 +153,32 @@ func (c *Client) ChatMembers(ctx context.Context, chatID string) (*ChatMembersRe
 	return &resp, nil
 }
 
+func (c *Client) Message(ctx context.Context, messageID string) (*MessageItem, error) {
+	messageID = strings.TrimSpace(messageID)
+	if messageID == "" {
+		return nil, fmt.Errorf("message_id is required")
+	}
+	token, err := c.tokenForRequest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var resp MessageResponse
+	if err := c.doJSON(ctx, http.MethodGet, "/im/v1/messages/"+url.PathEscape(messageID), map[string]string{
+		"user_id_type":          "open_id",
+		"card_msg_content_type": "raw_card_content",
+	}, nil, &resp, withBearer(token)); err != nil {
+		return nil, err
+	}
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("message get failed: code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	item := resp.FirstMessage()
+	if item == nil {
+		return nil, fmt.Errorf("message get failed: missing message")
+	}
+	return item, nil
+}
+
 func (c *Client) SendText(ctx context.Context, req SendTextRequest) (*SendTextResponse, error) {
 	if strings.TrimSpace(req.ReceiveID) == "" {
 		return nil, fmt.Errorf("receive_id is required")

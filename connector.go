@@ -500,6 +500,7 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 	}
 	senderDisplayName := resolveLarkDisplayNames(ctx, runtime, account, state, &chat, hook.Event.Sender)
 	inbound = buildInboundMessageWithIdentityForPlatform(platform, runtime.WorkspaceUUID, runtime.Channel.UUID, accountUUID, hook, text, bot, chat, senderDisplayName)
+	inbound.ReferencedMessage = resolveLarkReferencedMessage(ctx, runtime, account, state, platform, hook.Event.Message)
 
 	sessionUUID, err := runtime.Gateway.EnsureChatSession(ctx, sdk.EnsureChatSessionRequest{
 		WorkspaceUUID:       runtime.WorkspaceUUID,
@@ -591,6 +592,7 @@ func buildInboundMessageWithIdentityForPlatform(platform, workspaceUUID, channel
 	mentionAll := larkMentionsAll(hook.Event.Message.Mentions)
 	threadID := larkThreadID(hook.Event.Message)
 	platform = firstString(platform, Platform)
+	referenced := larkReferencedMessageFromEvent(platform, hook.Event.Message)
 	return sdk.InboundMessage{
 		WorkspaceUUID:     workspaceUUID,
 		Platform:          platform,
@@ -606,6 +608,7 @@ func buildInboundMessageWithIdentityForPlatform(platform, workspaceUUID, channel
 		SenderDisplayName: strings.TrimSpace(senderDisplayName),
 		MessageID:         hook.Event.Message.MessageID,
 		Text:              text,
+		ReferencedMessage: referenced,
 		DedupeKey:         hook.DedupeKey(accountUUID),
 		Mentions:          mentions,
 		MentionedMe:       larkMentionsBot(mentions, bot),
@@ -629,6 +632,67 @@ func buildInboundMessageWithIdentityForPlatform(platform, workspaceUUID, channel
 			"create_time":         hook.Event.Message.CreateTime,
 			"mentions":            hook.Event.Message.Mentions,
 			"mention_all":         mentionAll,
+		},
+	}
+}
+
+func resolveLarkReferencedMessage(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, accountState *state.AccountState, platform string, message lark.EventMessage) *sdk.ReferencedMessage {
+	ref := larkReferencedMessageFromEvent(platform, message)
+	if ref == nil {
+		return nil
+	}
+	if accountState == nil {
+		return ref
+	}
+	client := clientFromAccount(runtime, account)
+	seedLarkClientToken(client, accountState)
+	defer captureLarkClientToken(client, accountState)
+	item, err := client.Message(ctx, ref.MessageID)
+	if err != nil {
+		if ref.Raw == nil {
+			ref.Raw = map[string]any{}
+		}
+		ref.Raw["fetch_error"] = err.Error()
+		return ref
+	}
+	if item == nil {
+		return ref
+	}
+	eventMessage := item.EventMessage()
+	ref.MessageID = firstString(eventMessage.MessageID, ref.MessageID)
+	ref.ChatType = firstString(eventMessage.ChatType, ref.ChatType)
+	ref.ChatID = firstString(eventMessage.ChatID, ref.ChatID)
+	ref.ThreadID = firstString(eventMessage.ThreadID, ref.ThreadID)
+	ref.RootID = firstString(eventMessage.RootID, ref.RootID)
+	ref.SenderID = larkSenderID(item.Sender.SenderID)
+	ref.MessageType = strings.TrimSpace(eventMessage.MessageType)
+	ref.Text = eventMessage.Text()
+	ref.CreatedAt = strings.TrimSpace(eventMessage.CreateTime)
+	if ref.Raw == nil {
+		ref.Raw = map[string]any{}
+	}
+	ref.Raw["fetched"] = true
+	ref.Raw["sender_type"] = strings.TrimSpace(item.Sender.SenderType)
+	return ref
+}
+
+func larkReferencedMessageFromEvent(platform string, message lark.EventMessage) *sdk.ReferencedMessage {
+	parentID := strings.TrimSpace(message.ParentID)
+	if parentID == "" {
+		return nil
+	}
+	return &sdk.ReferencedMessage{
+		Platform:    firstString(platform, Platform),
+		MessageID:   parentID,
+		ChatType:    strings.TrimSpace(message.ChatType),
+		ChatID:      strings.TrimSpace(message.ChatID),
+		ThreadID:    strings.TrimSpace(message.ThreadID),
+		RootID:      strings.TrimSpace(message.RootID),
+		MessageType: strings.TrimSpace(message.MessageType),
+		Raw: map[string]any{
+			"parent_id": parentID,
+			"root_id":   strings.TrimSpace(message.RootID),
+			"thread_id": strings.TrimSpace(message.ThreadID),
 		},
 	}
 }

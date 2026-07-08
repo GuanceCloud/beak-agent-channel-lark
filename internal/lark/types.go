@@ -91,6 +91,55 @@ type MessageReactionResponse struct {
 	} `json:"data"`
 }
 
+type MessageResponse struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		Items   []MessageItem `json:"items"`
+		Message MessageItem   `json:"message"`
+	} `json:"data"`
+}
+
+func (r MessageResponse) FirstMessage() *MessageItem {
+	if len(r.Data.Items) > 0 {
+		return &r.Data.Items[0]
+	}
+	if strings.TrimSpace(r.Data.Message.MessageID) != "" {
+		return &r.Data.Message
+	}
+	return nil
+}
+
+type MessageItem struct {
+	MessageID      string      `json:"message_id"`
+	RootID         string      `json:"root_id"`
+	ParentID       string      `json:"parent_id"`
+	ThreadID       string      `json:"thread_id"`
+	ChatID         string      `json:"chat_id"`
+	ChatType       string      `json:"chat_type"`
+	MessageType    string      `json:"msg_type"`
+	MessageTypeAlt string      `json:"message_type"`
+	Content        string      `json:"content"`
+	CreateTime     string      `json:"create_time"`
+	Sender         EventSender `json:"sender"`
+	Mentions       []Mention   `json:"mentions"`
+}
+
+func (m MessageItem) EventMessage() EventMessage {
+	return EventMessage{
+		MessageID:   m.MessageID,
+		RootID:      m.RootID,
+		ParentID:    m.ParentID,
+		ThreadID:    m.ThreadID,
+		ChatID:      m.ChatID,
+		ChatType:    m.ChatType,
+		MessageType: firstNonEmptyString(m.MessageType, m.MessageTypeAlt),
+		Content:     m.Content,
+		CreateTime:  m.CreateTime,
+		Mentions:    m.Mentions,
+	}
+}
+
 type UserInfoResponse struct {
 	Code int    `json:"code"`
 	Msg  string `json:"msg"`
