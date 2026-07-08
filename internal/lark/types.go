@@ -468,7 +468,19 @@ func (m EventMessage) TextWithMentionFilter(strip func(Mention) bool) string {
 	if messageType == "post" {
 		return normalizeText(resolveMentionPlaceholders(postContentText(m.Content, m.Mentions, strip), m.Mentions, strip))
 	}
+	if isCardMessageType(messageType) {
+		return normalizeText(resolveMentionPlaceholders(cardContentText(m.Content), m.Mentions, strip))
+	}
 	return ""
+}
+
+func isCardMessageType(messageType string) bool {
+	switch strings.ToLower(strings.TrimSpace(messageType)) {
+	case "interactive", "card", "raw_card_content", "template_card":
+		return true
+	default:
+		return false
+	}
 }
 
 func postContentText(raw string, mentions []Mention, strip func(Mention) bool) string {
@@ -500,6 +512,100 @@ func renderPostBody(body map[string]any, mentions []Mention, strip func(Mention)
 		lines = append(lines, strings.TrimSpace(line.String()))
 	}
 	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func cardContentText(raw string) string {
+	var parsed any
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return strings.TrimSpace(raw)
+	}
+	var parts []string
+	appendCardText(&parts, parsed, 0)
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func appendCardText(parts *[]string, value any, depth int) {
+	if depth > 8 {
+		return
+	}
+	switch item := value.(type) {
+	case nil:
+		return
+	case string:
+		text := strings.TrimSpace(item)
+		if text == "" {
+			return
+		}
+		var nested any
+		if err := json.Unmarshal([]byte(text), &nested); err == nil {
+			before := len(*parts)
+			appendCardText(parts, nested, depth+1)
+			if len(*parts) > before {
+				return
+			}
+		}
+		appendTextPart(parts, text)
+	case []any:
+		for _, child := range item {
+			appendCardText(parts, child, depth+1)
+		}
+	case map[string]any:
+		appendCardMapText(parts, item, depth+1)
+	}
+}
+
+func appendCardMapText(parts *[]string, item map[string]any, depth int) {
+	if tag := strings.ToLower(strings.TrimSpace(anyString(item["tag"]))); tag != "" {
+		switch tag {
+		case "plain_text", "lark_md", "markdown", "md":
+			appendCardText(parts, firstNonEmptyAny(item["content"], item["text"]), depth)
+		case "div":
+			appendCardText(parts, item["text"], depth)
+			appendCardText(parts, item["fields"], depth)
+			appendCardText(parts, item["extra"], depth)
+		case "note":
+			appendCardText(parts, item["elements"], depth)
+		case "action":
+			appendCardText(parts, item["actions"], depth)
+		case "button":
+			appendCardText(parts, item["text"], depth)
+		case "img":
+			appendCardText(parts, item["alt"], depth)
+		case "column_set":
+			appendCardText(parts, item["columns"], depth)
+		case "column":
+			appendCardText(parts, item["elements"], depth)
+		case "hr":
+			return
+		default:
+			appendCardKnownFields(parts, item, depth)
+		}
+		return
+	}
+	appendCardKnownFields(parts, item, depth)
+}
+
+func appendCardKnownFields(parts *[]string, item map[string]any, depth int) {
+	for _, key := range []string{
+		"card", "card_content", "raw_card_content",
+		"header", "title", "subtitle",
+		"body", "elements", "content",
+		"text", "fields", "actions", "extra",
+		"alt", "placeholder", "options",
+		"fallback", "summary", "description",
+	} {
+		if value, ok := item[key]; ok {
+			appendCardText(parts, value, depth)
+		}
+	}
+}
+
+func appendTextPart(parts *[]string, text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	*parts = append(*parts, text)
 }
 
 func renderPostContentValue(value any, mentions []Mention, strip func(Mention) bool) string {

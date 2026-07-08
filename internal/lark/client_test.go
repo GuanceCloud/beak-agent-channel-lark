@@ -593,6 +593,67 @@ func TestEventMessagePostTextRendersContentArrayEnvelope(t *testing.T) {
 	}
 }
 
+func TestEventMessageInteractiveCardText(t *testing.T) {
+	msg := EventMessage{
+		MessageType: "interactive",
+		Content: `{
+			"header":{
+				"title":{"tag":"plain_text","content":"日志查询结果"}
+			},
+			"elements":[
+				{"tag":"div","text":{"tag":"lark_md","content":"**分析结果**\n\n1. 服务异常\n2. Trace ID 缺失"}},
+				{"tag":"div","fields":[
+					{"is_short":true,"text":{"tag":"plain_text","content":"服务"}},
+					{"is_short":true,"text":{"tag":"lark_md","content":"beak-gateway"}}
+				]},
+				{"tag":"action","actions":[
+					{"tag":"button","text":{"tag":"plain_text","content":"查看详情"}}
+				]}
+			]
+		}`,
+	}
+	want := "日志查询结果\n**分析结果**\n\n1. 服务异常\n2. Trace ID 缺失\n服务\nbeak-gateway\n查看详情"
+	if got := msg.Text(); got != want {
+		t.Fatalf("text=%q want=%q", got, want)
+	}
+}
+
+func TestMessageResponseInteractiveCardTextFromObjectContent(t *testing.T) {
+	payload, err := json.Marshal(map[string]any{
+		"code": 0,
+		"msg":  "ok",
+		"data": map[string]any{
+			"items": []map[string]any{{
+				"message_id": "om_parent",
+				"chat_id":    "oc_group",
+				"chat_type":  "group",
+				"msg_type":   "interactive",
+				"content": map[string]any{
+					"header": map[string]any{"title": map[string]any{"tag": "plain_text", "content": "引用卡片"}},
+					"elements": []map[string]any{{
+						"tag":  "div",
+						"text": map[string]any{"tag": "lark_md", "content": "卡片正文"},
+					}},
+				},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp MessageResponse
+	if err := json.Unmarshal(payload, &resp); err != nil {
+		t.Fatal(err)
+	}
+	item := resp.FirstMessage()
+	if item == nil {
+		t.Fatal("missing first message")
+	}
+	if got, want := item.EventMessage().Text(), "引用卡片\n卡片正文"; got != want {
+		t.Fatalf("text=%q want=%q", got, want)
+	}
+}
+
 func TestEventMessagePostTextMatchesMentionUserID(t *testing.T) {
 	msg := EventMessage{
 		MessageType: "post",
