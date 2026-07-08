@@ -833,10 +833,15 @@ func TestLarkConnectorWebhookThreadIDPropagates(t *testing.T) {
 						"message_id":  "om_parent",
 						"chat_id":     "oc_group",
 						"chat_type":   "group",
-						"msg_type":    "text",
-						"content":     `{"text":"quoted body"}`,
+						"msg_type":    "post",
+						"content":     `{"content":{"zh_cn":{"content":[[{"tag":"text","text":"quoted "},{"tag":"at","user_id":"ou_parent","user_name":"Parent"}]]}}}`,
 						"create_time": "1760000000000",
-						"sender":      map[string]any{"sender_id": map[string]any{"open_id": "ou_parent"}, "sender_type": "user"},
+						"mentions": []map[string]any{{
+							"key":  "@_parent",
+							"id":   "ou_parent",
+							"name": "Parent",
+						}},
+						"sender": map[string]any{"sender_id": map[string]any{"open_id": "ou_parent"}, "sender_type": "user"},
 					}},
 				},
 			})
@@ -873,7 +878,7 @@ func TestLarkConnectorWebhookThreadIDPropagates(t *testing.T) {
 	if !sawReferencedMessage {
 		t.Fatal("referenced message endpoint was not called")
 	}
-	if result.Inbound.ReferencedMessage == nil || result.Inbound.ReferencedMessage.MessageID != "om_parent" || result.Inbound.ReferencedMessage.Text != "quoted body" || result.Inbound.ReferencedMessage.SenderID != "ou_parent" {
+	if result.Inbound.ReferencedMessage == nil || result.Inbound.ReferencedMessage.MessageID != "om_parent" || result.Inbound.ReferencedMessage.Text != "quoted @Parent" || result.Inbound.ReferencedMessage.SenderID != "ou_parent" {
 		t.Fatalf("referenced_message=%+v", result.Inbound.ReferencedMessage)
 	}
 	gateway.mu.Lock()
@@ -888,7 +893,7 @@ func TestLarkConnectorWebhookThreadIDPropagates(t *testing.T) {
 	if !ok || inbound.ThreadID != "omt_thread" {
 		t.Fatalf("metadata inbound=%+v metadata=%+v", inbound, gateway.messages[0].Metadata)
 	}
-	if inbound.ReferencedMessage == nil || inbound.ReferencedMessage.MessageID != "om_parent" || inbound.ReferencedMessage.Text != "quoted body" {
+	if inbound.ReferencedMessage == nil || inbound.ReferencedMessage.MessageID != "om_parent" || inbound.ReferencedMessage.Text != "quoted @Parent" {
 		t.Fatalf("metadata referenced_message=%+v metadata=%+v", inbound.ReferencedMessage, gateway.messages[0].Metadata)
 	}
 	if inbound.ChatIdentity.ID != "oc_group" || inbound.ChatIdentity.Type != sdk.ChatTypeGroup {

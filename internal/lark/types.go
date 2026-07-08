@@ -245,6 +245,41 @@ type SenderID struct {
 	UnionID string `json:"union_id"`
 }
 
+func (id *SenderID) UnmarshalJSON(data []byte) error {
+	raw := strings.TrimSpace(string(data))
+	if raw == "" || raw == "null" {
+		return nil
+	}
+	if strings.HasPrefix(raw, "{") {
+		var object struct {
+			OpenID  string `json:"open_id"`
+			UserID  string `json:"user_id"`
+			UnionID string `json:"union_id"`
+		}
+		if err := json.Unmarshal(data, &object); err != nil {
+			return err
+		}
+		id.OpenID = strings.TrimSpace(object.OpenID)
+		id.UserID = strings.TrimSpace(object.UserID)
+		id.UnionID = strings.TrimSpace(object.UnionID)
+		return nil
+	}
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	value = strings.TrimSpace(value)
+	switch {
+	case strings.HasPrefix(value, "ou_"):
+		id.OpenID = value
+	case strings.HasPrefix(value, "on_"):
+		id.UnionID = value
+	default:
+		id.UserID = value
+	}
+	return nil
+}
+
 type EventMessage struct {
 	MessageID   string    `json:"message_id"`
 	RootID      string    `json:"root_id"`
@@ -419,14 +454,16 @@ func unwrapPostLocaleDepth(parsed map[string]any, depth int) map[string]any {
 	if parsed == nil || depth > 4 {
 		return nil
 	}
-	if _, ok := parsed["content"]; ok {
-		return parsed
-	}
-	if _, ok := parsed["title"]; ok {
+	if isPostBody(parsed) {
 		return parsed
 	}
 	if post, ok := parsed["post"].(map[string]any); ok {
 		if body := unwrapPostLocaleDepth(post, depth+1); body != nil {
+			return body
+		}
+	}
+	if content, ok := parsed["content"].(map[string]any); ok {
+		if body := unwrapPostLocaleDepth(content, depth+1); body != nil {
 			return body
 		}
 	}
@@ -443,6 +480,20 @@ func unwrapPostLocaleDepth(parsed map[string]any, depth int) map[string]any {
 		}
 	}
 	return nil
+}
+
+func isPostBody(parsed map[string]any) bool {
+	if parsed == nil {
+		return false
+	}
+	if _, ok := parsed["content"].([]any); ok {
+		return true
+	}
+	if _, ok := parsed["title"]; !ok {
+		return false
+	}
+	_, contentIsMap := parsed["content"].(map[string]any)
+	return !contentIsMap
 }
 
 func renderPostElement(value any, mentions []Mention, strip func(Mention) bool) string {

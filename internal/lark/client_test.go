@@ -487,6 +487,62 @@ func TestEventMessagePostTextUnwrapsPostLocaleEnvelope(t *testing.T) {
 	}
 }
 
+func TestEventMessagePostTextUnwrapsContentLocaleEnvelope(t *testing.T) {
+	msg := EventMessage{
+		MessageType: "post",
+		Content: `{
+			"content":{
+				"zh_cn":{
+					"content":[
+						[{"tag":"text","text":"包装正文"}]
+					]
+				}
+			}
+		}`,
+	}
+	got := msg.Text()
+	want := "包装正文"
+	if got != want {
+		t.Fatalf("text=%q want=%q", got, want)
+	}
+}
+
+func TestMessageResponseAcceptsStringMentionIDAndPostText(t *testing.T) {
+	content := `{"zh_cn":{"content":[[{"tag":"text","text":"hello "},{"tag":"at","user_id":"ou_user","user_name":"Alice"}]]}}`
+	payload, err := json.Marshal(map[string]any{
+		"code": 0,
+		"msg":  "ok",
+		"data": map[string]any{
+			"items": []map[string]any{{
+				"message_id": "om_parent",
+				"chat_id":    "oc_group",
+				"chat_type":  "group",
+				"msg_type":   "post",
+				"content":    content,
+				"mentions": []map[string]any{{
+					"key":  "@_user",
+					"id":   "ou_user",
+					"name": "Alice",
+				}},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp MessageResponse
+	if err := json.Unmarshal(payload, &resp); err != nil {
+		t.Fatal(err)
+	}
+	item := resp.FirstMessage()
+	if item == nil {
+		t.Fatal("missing first message")
+	}
+	if got := item.EventMessage().Text(); got != "hello @Alice" {
+		t.Fatalf("text=%q", got)
+	}
+}
+
 func TestEventMessagePostTextMatchesMentionUserID(t *testing.T) {
 	msg := EventMessage{
 		MessageType: "post",
