@@ -137,9 +137,12 @@ func (m *MessageItem) UnmarshalJSON(data []byte) error {
 		MessageType    string          `json:"msg_type"`
 		MessageTypeAlt string          `json:"message_type"`
 		Content        json.RawMessage `json:"content"`
-		CreateTime     string          `json:"create_time"`
-		Sender         EventSender     `json:"sender"`
-		Mentions       []Mention       `json:"mentions"`
+		Body           struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"body"`
+		CreateTime string      `json:"create_time"`
+		Sender     EventSender `json:"sender"`
+		Mentions   []Mention   `json:"mentions"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -153,7 +156,7 @@ func (m *MessageItem) UnmarshalJSON(data []byte) error {
 		ChatType:       raw.ChatType,
 		MessageType:    raw.MessageType,
 		MessageTypeAlt: raw.MessageTypeAlt,
-		Content:        rawMessageString(raw.Content),
+		Content:        rawMessageString(firstRawMessage(raw.Content, raw.Body.Content)),
 		CreateTime:     raw.CreateTime,
 		Sender:         raw.Sender,
 		Mentions:       raw.Mentions,
@@ -174,6 +177,15 @@ func (m MessageItem) EventMessage() EventMessage {
 		CreateTime:  m.CreateTime,
 		Mentions:    m.Mentions,
 	}
+}
+
+func firstRawMessage(values ...json.RawMessage) json.RawMessage {
+	for _, value := range values {
+		if len(bytes.TrimSpace(value)) > 0 {
+			return value
+		}
+	}
+	return nil
 }
 
 func rawMessageString(raw json.RawMessage) string {

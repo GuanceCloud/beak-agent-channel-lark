@@ -554,7 +554,7 @@ func TestMessageResponsePostTextUnwrapsNestedContentString(t *testing.T) {
 				"chat_id":    "oc_group",
 				"chat_type":  "group",
 				"msg_type":   "post",
-				"content":    map[string]any{"content": nestedContent},
+				"body":       map[string]any{"content": nestedContent},
 			}},
 		},
 	})
@@ -628,12 +628,14 @@ func TestMessageResponseInteractiveCardTextFromObjectContent(t *testing.T) {
 				"chat_id":    "oc_group",
 				"chat_type":  "group",
 				"msg_type":   "interactive",
-				"content": map[string]any{
-					"header": map[string]any{"title": map[string]any{"tag": "plain_text", "content": "引用卡片"}},
-					"elements": []map[string]any{{
-						"tag":  "div",
-						"text": map[string]any{"tag": "lark_md", "content": "卡片正文"},
-					}},
+				"body": map[string]any{
+					"content": map[string]any{
+						"header": map[string]any{"title": map[string]any{"tag": "plain_text", "content": "引用卡片"}},
+						"elements": []map[string]any{{
+							"tag":  "div",
+							"text": map[string]any{"tag": "lark_md", "content": "卡片正文"},
+						}},
+					},
 				},
 			}},
 		},
