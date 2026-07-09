@@ -537,7 +537,7 @@ func cardContentText(raw string) string {
 }
 
 func appendCardText(parts *[]string, value any, depth int) {
-	if depth > 8 {
+	if depth > 32 {
 		return
 	}
 	switch item := value.(type) {
@@ -567,26 +567,45 @@ func appendCardText(parts *[]string, value any, depth int) {
 }
 
 func appendCardMapText(parts *[]string, item map[string]any, depth int) {
+	if value, ok := item["json_card"]; ok {
+		before := len(*parts)
+		appendCardText(parts, value, depth)
+		if len(*parts) > before {
+			return
+		}
+	}
 	if tag := strings.ToLower(strings.TrimSpace(anyString(item["tag"]))); tag != "" {
 		switch tag {
 		case "plain_text", "lark_md", "markdown", "md":
 			appendCardText(parts, firstNonEmptyAny(item["content"], item["text"]), depth)
+			appendCardText(parts, item["property"], depth)
 		case "div":
 			appendCardText(parts, item["text"], depth)
 			appendCardText(parts, item["fields"], depth)
 			appendCardText(parts, item["extra"], depth)
+			appendCardText(parts, item["property"], depth)
 		case "note":
 			appendCardText(parts, item["elements"], depth)
+			appendCardText(parts, item["property"], depth)
 		case "action":
 			appendCardText(parts, item["actions"], depth)
+			appendCardText(parts, item["property"], depth)
 		case "button":
 			appendCardText(parts, item["text"], depth)
+			appendCardText(parts, item["property"], depth)
+		case "at":
+			appendCardText(parts, item["content"], depth)
+			appendCardText(parts, item["text"], depth)
+			appendCardText(parts, item["property"], depth)
 		case "img":
 			appendCardText(parts, item["alt"], depth)
+			appendCardText(parts, item["property"], depth)
 		case "column_set":
 			appendCardText(parts, item["columns"], depth)
+			appendCardText(parts, item["property"], depth)
 		case "column":
 			appendCardText(parts, item["elements"], depth)
+			appendCardText(parts, item["property"], depth)
 		case "hr":
 			return
 		default:
@@ -599,9 +618,9 @@ func appendCardMapText(parts *[]string, item map[string]any, depth int) {
 
 func appendCardKnownFields(parts *[]string, item map[string]any, depth int) {
 	for _, key := range []string{
-		"card", "card_content", "raw_card_content",
+		"card", "card_content", "raw_card_content", "json_attachment",
 		"header", "title", "subtitle",
-		"body", "elements", "content",
+		"body", "elements", "content", "property",
 		"text", "fields", "actions", "extra",
 		"alt", "placeholder", "options",
 		"fallback", "summary", "description",

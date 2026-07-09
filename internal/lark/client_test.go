@@ -618,6 +618,61 @@ func TestEventMessageInteractiveCardText(t *testing.T) {
 	}
 }
 
+func TestEventMessageInteractiveJSONCardText(t *testing.T) {
+	card, err := json.Marshal(map[string]any{
+		"header": map[string]any{
+			"title": map[string]any{
+				"tag":      "plain_text",
+				"property": map[string]any{"content": "【观测云问题反馈】监控配置检测器导出任务出现 confirmed_code_bug"},
+			},
+		},
+		"body": map[string]any{
+			"elements": []map[string]any{{
+				"tag": "div",
+				"property": map[string]any{
+					"text": map[string]any{
+						"tag": "markdown",
+						"property": map[string]any{
+							"elements": []map[string]any{
+								{"tag": "plain_text", "property": map[string]any{"content": "请关注："}},
+								{"tag": "plain_text", "property": map[string]any{"content": "组长"}},
+								{"tag": "at", "property": map[string]any{"content": "赵国磊", "userID": "g495987b"}},
+								{"tag": "plain_text", "property": map[string]any{"content": "用户消息"}},
+								{"tag": "br", "property": map[string]any{}},
+								{"tag": "plain_text", "property": map[string]any{"content": "监控配置 检测器 checker 导出任务出现 confirmed_code_bug。"}},
+							},
+						},
+					},
+				},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := json.Marshal(map[string]any{"json_card": string(card)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := EventMessage{
+		MessageType: "interactive",
+		Content:     string(content),
+	}
+	got := msg.Text()
+	for _, want := range []string{
+		"【观测云问题反馈】监控配置检测器导出任务出现 confirmed_code_bug",
+		"请关注：",
+		"组长",
+		"赵国磊",
+		"用户消息",
+		"监控配置 检测器 checker 导出任务出现 confirmed_code_bug。",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("text=%q should contain %q", got, want)
+		}
+	}
+}
+
 func TestMessageResponseInteractiveCardTextFromObjectContent(t *testing.T) {
 	payload, err := json.Marshal(map[string]any{
 		"code": 0,
