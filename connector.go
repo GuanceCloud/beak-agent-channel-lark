@@ -249,13 +249,24 @@ func (c Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.Outbou
 		return nil, err
 	}
 	var resp *lark.SendMessageResponse
-	if replyTo := firstString(req.Raw["reply_to_message_id"], req.Raw["parent_message_id"]); replyTo != "" {
+	replyTo := firstString(req.Raw["reply_to_message_id"], req.Raw["parent_message_id"])
+	replyInThread := optionalBool(req.Raw["reply_in_thread"])
+	if replyTo == "" {
+		replyTo, replyInThread, err = larkReplyTarget(ctx, client, req.ThreadID)
+		if err != nil {
+			return nil, err
+		}
+	} else if replyInThread == nil && strings.HasPrefix(strings.TrimSpace(req.ThreadID), "omt_") {
+		value := true
+		replyInThread = &value
+	}
+	if replyTo != "" {
 		resp, err = client.ReplyMessage(ctx, lark.ReplyMessageRequest{
 			MessageID:     replyTo,
 			MsgType:       msgType,
 			Content:       content,
 			UUID:          req.MessageUUID,
-			ReplyInThread: optionalBool(req.Raw["reply_in_thread"]),
+			ReplyInThread: replyInThread,
 		})
 	} else {
 		resp, err = client.SendMessage(ctx, lark.SendMessageRequest{
@@ -269,7 +280,7 @@ func (c Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.Outbou
 	if err != nil {
 		return nil, err
 	}
-	return &sdk.SendResult{
+	result := &sdk.SendResult{
 		Platform:    platform,
 		AccountUUID: accountUUID,
 		MessageID:   resp.Data.MessageID,
@@ -277,7 +288,28 @@ func (c Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.Outbou
 			"chat_id":  resp.Data.ChatID,
 			"msg_type": msgType,
 		},
-	}, nil
+	}
+	if threadID := strings.TrimSpace(req.ThreadID); threadID != "" {
+		result.Raw["thread_id"] = threadID
+		result.Raw["reply_to_message_id"] = replyTo
+	}
+	return result, nil
+}
+
+func larkReplyTarget(ctx context.Context, client *lark.Client, threadID string) (string, *bool, error) {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return "", nil, nil
+	}
+	if strings.HasPrefix(threadID, "om_") {
+		return threadID, nil, nil
+	}
+	message, err := client.LatestThreadMessage(ctx, threadID)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve lark thread %s reply target: %w", threadID, err)
+	}
+	value := true
+	return strings.TrimSpace(message.MessageID), &value, nil
 }
 
 func (c Connector) Acknowledge(ctx context.Context, runtime sdk.Runtime, req sdk.OutboundAck) (*sdk.AckResult, error) {

@@ -179,6 +179,36 @@ func (c *Client) Message(ctx context.Context, messageID string) (*MessageItem, e
 	return item, nil
 }
 
+func (c *Client) LatestThreadMessage(ctx context.Context, threadID string) (*MessageItem, error) {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return nil, fmt.Errorf("thread_id is required")
+	}
+	token, err := c.tokenForRequest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var resp MessageResponse
+	if err := c.doJSON(ctx, http.MethodGet, "/im/v1/messages", map[string]string{
+		"container_id_type":     "thread",
+		"container_id":          threadID,
+		"sort_type":             "ByCreateTimeDesc",
+		"page_size":             "1",
+		"user_id_type":          "open_id",
+		"card_msg_content_type": "raw_card_content",
+	}, nil, &resp, withBearer(token)); err != nil {
+		return nil, err
+	}
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("thread messages get failed: code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	item := resp.FirstMessage()
+	if item == nil || strings.TrimSpace(item.MessageID) == "" {
+		return nil, fmt.Errorf("thread messages get failed: thread %s has no reply target", threadID)
+	}
+	return item, nil
+}
+
 func (c *Client) SendText(ctx context.Context, req SendTextRequest) (*SendTextResponse, error) {
 	if strings.TrimSpace(req.ReceiveID) == "" {
 		return nil, fmt.Errorf("receive_id is required")

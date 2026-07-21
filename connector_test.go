@@ -1718,6 +1718,61 @@ func TestLarkConnectorSendReplyAndRawContent(t *testing.T) {
 	}
 }
 
+func TestLarkConnectorSendUsesCommonThreadID(t *testing.T) {
+	var sawLookup bool
+	var sawReply bool
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "token-1", "expire": 7200})
+		case "/open-apis/im/v1/messages":
+			if r.Method != http.MethodGet {
+				t.Fatalf("thread lookup method=%s", r.Method)
+			}
+			sawLookup = true
+			query := r.URL.Query()
+			if query.Get("container_id_type") != "thread" || query.Get("container_id") != "omt_thread" || query.Get("sort_type") != "ByCreateTimeDesc" {
+				t.Fatalf("thread query=%s", r.URL.RawQuery)
+			}
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"items": []map[string]any{{"message_id": "om_latest", "thread_id": "omt_thread"}}}})
+		case "/open-apis/im/v1/messages/om_latest/reply":
+			sawReply = true
+			var body struct {
+				MsgType       string `json:"msg_type"`
+				Content       string `json:"content"`
+				ReplyInThread bool   `json:"reply_in_thread"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body.MsgType != "text" || body.Content != `{"text":"thread reply"}` || !body.ReplyInThread {
+				t.Fatalf("reply body=%+v", body)
+			}
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"message_id": "om_thread_reply", "chat_id": "oc_group"}})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		return nil, nil
+	})}
+
+	result, err := NewConnector().Send(context.Background(), sdk.Runtime{
+		HTTPClient: httpClient,
+		Account:    sdkAccount("account-1", "cli_1", "secret_1", "https://open.feishu.test"),
+	}, sdk.OutboundMessage{
+		AccountUUID: "account-1",
+		ChatType:    sdk.ChatTypeGroup,
+		ChatID:      "oc_group",
+		ThreadID:    "omt_thread",
+		Text:        "thread reply",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawLookup || !sawReply || result.MessageID != "om_thread_reply" || result.Raw["thread_id"] != "omt_thread" || result.Raw["reply_to_message_id"] != "om_latest" {
+		t.Fatalf("sawLookup=%v sawReply=%v result=%+v", sawLookup, sawReply, result)
+	}
+}
+
 func larkStreamEventFrameForTest(t *testing.T, messageID string) []byte {
 	t.Helper()
 	payload := []byte(`{

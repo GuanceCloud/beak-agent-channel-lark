@@ -259,12 +259,21 @@ func TestClientUserInfoAndChatInfo(t *testing.T) {
 func TestClientSendGenericAndReplyMessage(t *testing.T) {
 	var sawSend bool
 	var sawReply bool
+	var sawThreadLookup bool
 	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if got := r.Header.Get("Authorization"); got != "Bearer cached-token" {
 			t.Fatalf("auth=%q", got)
 		}
 		switch r.URL.Path {
 		case "/open-apis/im/v1/messages":
+			if r.Method == http.MethodGet {
+				sawThreadLookup = true
+				query := r.URL.Query()
+				if query.Get("container_id_type") != "thread" || query.Get("container_id") != "omt_thread" || query.Get("sort_type") != "ByCreateTimeDesc" || query.Get("page_size") != "1" {
+					t.Fatalf("thread query=%s", r.URL.RawQuery)
+				}
+				return jsonResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"items": []map[string]any{{"message_id": "om_latest", "thread_id": "omt_thread"}}}})
+			}
 			sawSend = true
 			var body map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -310,8 +319,12 @@ func TestClientSendGenericAndReplyMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !sawSend || !sawReply {
-		t.Fatalf("sawSend=%v sawReply=%v", sawSend, sawReply)
+	latest, err := client.LatestThreadMessage(context.Background(), "omt_thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.MessageID != "om_latest" || !sawSend || !sawReply || !sawThreadLookup {
+		t.Fatalf("latest=%+v sawSend=%v sawReply=%v sawThreadLookup=%v", latest, sawSend, sawReply, sawThreadLookup)
 	}
 }
 
