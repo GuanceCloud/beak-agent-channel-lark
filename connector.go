@@ -19,6 +19,11 @@ import (
 
 var ErrCredentialLogin = errors.New("lark connector uses credential login; create channel account from CredentialSchema")
 
+const (
+	credentialValidationAttempts   = 2
+	credentialValidationRetryDelay = 100 * time.Millisecond
+)
+
 type Connector struct {
 	channel Channel
 }
@@ -106,13 +111,12 @@ func (Connector) ValidateCredential(ctx context.Context, req sdk.CredentialValid
 	client.HTTPClient = req.Runtime.HTTPClient
 
 	now := time.Now().UTC()
-	token, expiresAt, err := client.TenantAccessTokenWithExpiry(ctx, now)
+	token, expiresAt, info, err := validateLarkCredential(ctx, client, now)
 	if err != nil {
-		return credentialValidationFailure(credential, state, platform, err), nil
-	}
-	info, err := client.BotInfo(ctx)
-	if err != nil {
-		return credentialValidationFailure(credential, state, platform, err), nil
+		if lark.IsCredentialRejected(err) {
+			return credentialValidationFailure(credential, state, platform, err), nil
+		}
+		return nil, fmt.Errorf("%s credential validation failed: %w", platform, err)
 	}
 
 	accountKey := firstString(credential["account_id"], credential["app_id"])
@@ -151,6 +155,39 @@ func (Connector) ValidateCredential(ctx context.Context, req sdk.CredentialValid
 			"ip_white_list":   info.Bot.IPWhiteList,
 		},
 	}, nil
+}
+
+func validateLarkCredential(ctx context.Context, client *lark.Client, now time.Time) (string, time.Time, *lark.BotInfoResponse, error) {
+	var lastErr error
+	for attempt := 0; attempt < credentialValidationAttempts; attempt++ {
+		token, expiresAt, err := client.TenantAccessTokenWithExpiry(ctx, now)
+		if err == nil {
+			info, infoErr := client.BotInfo(ctx)
+			if infoErr == nil {
+				return token, expiresAt, info, nil
+			}
+			err = infoErr
+		}
+		lastErr = err
+		if lark.IsCredentialRejected(err) || !lark.IsRetryableError(err) || attempt+1 == credentialValidationAttempts {
+			break
+		}
+		if err := waitForCredentialRetry(ctx); err != nil {
+			return "", time.Time{}, nil, err
+		}
+	}
+	return "", time.Time{}, nil, lastErr
+}
+
+func waitForCredentialRetry(ctx context.Context) error {
+	timer := time.NewTimer(credentialValidationRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (Connector) StartLogin(context.Context, sdk.LoginStartRequest) (*sdk.LoginChallenge, error) {

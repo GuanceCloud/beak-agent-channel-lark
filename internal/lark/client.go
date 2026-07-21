@@ -47,10 +47,10 @@ func (c *Client) TenantAccessTokenWithExpiry(ctx context.Context, now time.Time)
 		return c.TenantToken, c.TenantTokenExpiresAt, nil
 	}
 	if strings.TrimSpace(c.AppID) == "" {
-		return "", time.Time{}, fmt.Errorf("app_id is required")
+		return "", time.Time{}, credentialRejected("app_id is required")
 	}
 	if strings.TrimSpace(c.AppSecret) == "" {
-		return "", time.Time{}, fmt.Errorf("app_secret is required")
+		return "", time.Time{}, credentialRejected("app_secret is required")
 	}
 	var resp TokenResponse
 	if err := c.doJSON(ctx, http.MethodPost, "/auth/v3/tenant_access_token/internal", nil, map[string]string{
@@ -60,10 +60,10 @@ func (c *Client) TenantAccessTokenWithExpiry(ctx context.Context, now time.Time)
 		return "", time.Time{}, err
 	}
 	if resp.Code != 0 {
-		return "", time.Time{}, fmt.Errorf("tenant access token failed: code=%d msg=%s", resp.Code, resp.Msg)
+		return "", time.Time{}, responseError("tenant access token", resp.Code, resp.Msg)
 	}
 	if strings.TrimSpace(resp.TenantAccessToken) == "" {
-		return "", time.Time{}, fmt.Errorf("tenant access token failed: missing token")
+		return "", time.Time{}, transientFailure("tenant access token failed: missing token")
 	}
 	expiresIn := resp.Expire
 	if expiresIn <= 0 {
@@ -85,10 +85,10 @@ func (c *Client) BotInfo(ctx context.Context) (*BotInfoResponse, error) {
 		return nil, err
 	}
 	if resp.Code != 0 {
-		return nil, fmt.Errorf("bot info failed: code=%d msg=%s", resp.Code, resp.Msg)
+		return nil, responseError("bot info", resp.Code, resp.Msg)
 	}
 	if strings.TrimSpace(resp.Bot.OpenID) == "" {
-		return nil, fmt.Errorf("bot info failed: missing open_id")
+		return nil, transientFailure("bot info failed: missing open_id")
 	}
 	return &resp, nil
 }
@@ -385,13 +385,13 @@ func (c *Client) doJSON(ctx context.Context, method, path string, query map[stri
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("%s %s failed: status=%d body=%s", method, path, resp.StatusCode, string(data))
+		return &HTTPError{StatusCode: resp.StatusCode, Method: method, Path: path, Body: string(data)}
 	}
 	if out == nil || len(bytes.TrimSpace(data)) == 0 {
 		return nil
 	}
 	if err := json.Unmarshal(data, out); err != nil {
-		return fmt.Errorf("decode response: %w", err)
+		return transientFailure(fmt.Sprintf("decode response: %v", err))
 	}
 	return nil
 }

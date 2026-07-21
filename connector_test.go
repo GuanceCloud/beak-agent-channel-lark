@@ -145,7 +145,7 @@ func TestLarkConnectorValidateCredentialReturnsInvalidOnTokenFailure(t *testing.
 		if req.URL.Path != "/open-apis/auth/v3/tenant_access_token/internal" {
 			t.Fatalf("unexpected request: %s", req.URL.Path)
 		}
-		return testJSONResponse(map[string]any{"code": 999, "msg": "bad secret"})
+		return testJSONResponse(map[string]any{"code": 10015, "msg": "bad secret"})
 	})}
 
 	result, err := NewConnector().ValidateCredential(context.Background(), sdk.CredentialValidationRequest{
@@ -157,6 +157,77 @@ func TestLarkConnectorValidateCredentialReturnsInvalidOnTokenFailure(t *testing.
 	}
 	if result.Valid || result.AccountKey != "cli_bad" || !strings.Contains(result.Error, "bad secret") {
 		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestLarkConnectorValidateCredentialRetriesTransientFailure(t *testing.T) {
+	var tokenCalls int
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			tokenCalls++
+			if tokenCalls == 1 {
+				response, err := testJSONResponse(map[string]any{"msg": "temporary"})
+				response.StatusCode = http.StatusServiceUnavailable
+				return response, err
+			}
+			return testJSONResponse(map[string]any{"code": 0, "tenant_access_token": "token-recovered", "expire": 3600})
+		case "/open-apis/bot/v3/info":
+			return testJSONResponse(map[string]any{"code": 0, "bot": map[string]any{"open_id": "ou_retry", "app_name": "Retry Bot"}})
+		default:
+			t.Fatalf("unexpected request path %s", req.URL.Path)
+			return nil, nil
+		}
+	})}
+	result, err := NewConnector().ValidateCredential(context.Background(), sdk.CredentialValidationRequest{
+		Credential: map[string]any{"app_id": "cli_retry", "app_secret": "secret_retry"},
+		Runtime:    sdk.Runtime{HTTPClient: httpClient},
+	})
+	if err != nil || result == nil || !result.Valid {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+	if tokenCalls != 2 {
+		t.Fatalf("token calls=%d, want 2", tokenCalls)
+	}
+}
+
+func TestLarkConnectorValidateCredentialReturnsGoErrorOnPersistentServerFailure(t *testing.T) {
+	var calls int
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		response, err := testJSONResponse(map[string]any{"msg": "temporary"})
+		response.StatusCode = http.StatusServiceUnavailable
+		return response, err
+	})}
+	result, err := NewConnector().ValidateCredential(context.Background(), sdk.CredentialValidationRequest{
+		Credential: map[string]any{"app_id": "cli_transient", "app_secret": "secret_transient"},
+		Runtime:    sdk.Runtime{HTTPClient: httpClient},
+	})
+	if err == nil || result != nil || !strings.Contains(err.Error(), "503") {
+		t.Fatalf("result=%+v error=%v, want transient Go error", result, err)
+	}
+	if calls != credentialValidationAttempts {
+		t.Fatalf("calls=%d, want %d", calls, credentialValidationAttempts)
+	}
+}
+
+func TestLarkConnectorValidateCredentialRetriesTransientApplicationFailure(t *testing.T) {
+	var calls int
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		response, err := testJSONResponse(map[string]any{"code": 65001, "msg": "internal error"})
+		response.StatusCode = http.StatusBadRequest
+		return response, err
+	})}
+	result, err := NewConnector().ValidateCredential(context.Background(), sdk.CredentialValidationRequest{
+		Credential: map[string]any{"app_id": "cli_transient_body", "app_secret": "secret_transient_body"},
+		Runtime:    sdk.Runtime{HTTPClient: httpClient},
+	})
+	if err == nil || result != nil || !strings.Contains(err.Error(), "65001") {
+		t.Fatalf("result=%+v error=%v, want transient Go error", result, err)
+	}
+	if calls != credentialValidationAttempts {
+		t.Fatalf("calls=%d, want %d", calls, credentialValidationAttempts)
 	}
 }
 
