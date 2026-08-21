@@ -71,6 +71,7 @@ func (c Connector) Metadata() sdk.ConnectorMetadata {
 			LoginModes:       []string{sdk.LoginModeCredential},
 			Text:             caps.Text,
 			Media:            caps.Media,
+			MediaKinds:       append([]string(nil), caps.MediaKinds...),
 			GroupChat:        caps.GroupChat,
 			DirectChat:       caps.DirectChat,
 			Stream:           true,
@@ -280,15 +281,9 @@ func (c Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.Outbou
 	if target == "" {
 		return nil, fmt.Errorf("lark outbound chat_id is required")
 	}
-	msgType := outboundMsgType(req)
-	content, err := outboundContent(req, msgType)
-	if err != nil {
-		return nil, err
-	}
-	var resp *lark.SendMessageResponse
 	replyTo := firstString(req.Raw["reply_to_message_id"], req.Raw["parent_message_id"])
 	replyInThread := optionalBool(req.Raw["reply_in_thread"])
-	if replyTo == "" {
+	if replyTo == "" && (strings.TrimSpace(req.ThreadID) != "" || hasLarkOutboundText(req)) {
 		replyTo, replyInThread, err = larkReplyTarget(ctx, client, req.ThreadID)
 		if err != nil {
 			return nil, err
@@ -297,40 +292,168 @@ func (c Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.Outbou
 		value := true
 		replyInThread = &value
 	}
-	if replyTo != "" {
-		resp, err = client.ReplyMessage(ctx, lark.ReplyMessageRequest{
-			MessageID:     replyTo,
-			MsgType:       msgType,
-			Content:       content,
-			UUID:          req.MessageUUID,
-			ReplyInThread: replyInThread,
-		})
-	} else {
-		resp, err = client.SendMessage(ctx, lark.SendMessageRequest{
-			ReceiveID:     target,
-			ReceiveIDType: receiveIDType(req),
-			MsgType:       msgType,
-			Content:       content,
-			UUID:          req.MessageUUID,
-		})
-	}
-	if err != nil {
-		return nil, err
-	}
 	result := &sdk.SendResult{
 		Platform:    platform,
 		AccountUUID: accountUUID,
-		MessageID:   resp.Data.MessageID,
-		Raw: map[string]any{
-			"chat_id":  resp.Data.ChatID,
-			"msg_type": msgType,
-		},
+		Raw:         map[string]any{"chat_id": target},
 	}
 	if threadID := strings.TrimSpace(req.ThreadID); threadID != "" {
 		result.Raw["thread_id"] = threadID
 		result.Raw["reply_to_message_id"] = replyTo
 	}
+	if hasLarkOutboundText(req) {
+		msgType := outboundMsgType(req)
+		content, contentErr := outboundContent(req, msgType)
+		if contentErr != nil {
+			return nil, contentErr
+		}
+		resp, sendErr := sendLarkMessage(ctx, client, target, receiveIDType(req), replyTo, replyInThread, msgType, content, req.MessageUUID)
+		if sendErr != nil {
+			return nil, sendErr
+		}
+		result.MessageID = strings.TrimSpace(resp.Data.MessageID)
+		result.Raw["msg_type"] = msgType
+		result.Raw["chat_id"] = firstString(resp.Data.ChatID, target)
+	}
+	var attachmentErrors []string
+	for _, attachment := range req.Attachments {
+		item := sdk.AttachmentSendResult{
+			AttachmentID: attachment.ID,
+			Kind:         attachment.Kind,
+			Status:       sdk.AttachmentStatusFailed,
+		}
+		if validateErr := sdk.ValidateMediaAttachment(attachment); validateErr != nil {
+			item.Error = validateErr.Error()
+			attachmentErrors = append(attachmentErrors, item.Error)
+			result.AttachmentResults = append(result.AttachmentResults, item)
+			continue
+		}
+		path := strings.TrimSpace(attachment.Path)
+		cleanup := func() {}
+		if path == "" && strings.TrimSpace(attachment.URL) != "" {
+			var downloadErr error
+			path, cleanup, downloadErr = client.DownloadURL(ctx, attachment.URL)
+			if downloadErr != nil {
+				item.Error = downloadErr.Error()
+				attachmentErrors = append(attachmentErrors, item.Error)
+				result.AttachmentResults = append(result.AttachmentResults, item)
+				continue
+			}
+		}
+		if path == "" {
+			item.Error = "lark outbound attachment path or URL is required"
+			attachmentErrors = append(attachmentErrors, item.Error)
+			result.AttachmentResults = append(result.AttachmentResults, item)
+			continue
+		}
+		key, uploadErr := client.UploadMedia(ctx, path, attachment.Kind, attachment.FileName)
+		cleanup()
+		if uploadErr != nil {
+			item.Error = uploadErr.Error()
+			attachmentErrors = append(attachmentErrors, item.Error)
+			result.AttachmentResults = append(result.AttachmentResults, item)
+			continue
+		}
+		msgType, mediaContent, status, contentErr := larkMediaMessage(attachment, key)
+		if contentErr != nil {
+			item.Error = contentErr.Error()
+			attachmentErrors = append(attachmentErrors, item.Error)
+			result.AttachmentResults = append(result.AttachmentResults, item)
+			continue
+		}
+		resp, sendErr := sendLarkMessage(ctx, client, target, receiveIDType(req), replyTo, replyInThread, msgType, mediaContent, "")
+		if sendErr != nil {
+			item.Error = sendErr.Error()
+			attachmentErrors = append(attachmentErrors, item.Error)
+			result.AttachmentResults = append(result.AttachmentResults, item)
+			continue
+		}
+		item.Status = status
+		item.MessageID = strings.TrimSpace(resp.Data.MessageID)
+		item.PlatformResourceID = key
+		result.MessageID = firstString(item.MessageID, result.MessageID)
+		result.Raw["chat_id"] = firstString(resp.Data.ChatID, target)
+		result.AttachmentResults = append(result.AttachmentResults, item)
+	}
+	if len(attachmentErrors) > 0 {
+		result.Raw["attachment_errors"] = attachmentErrors
+	}
+	if strings.TrimSpace(result.MessageID) == "" {
+		if len(req.Attachments) == 0 {
+			return nil, fmt.Errorf("lark outbound text is required")
+		}
+		return result, fmt.Errorf("lark outbound attachments failed")
+	}
 	return result, nil
+}
+
+func hasLarkOutboundText(req sdk.OutboundMessage) bool {
+	if strings.TrimSpace(req.Text) != "" {
+		return true
+	}
+	if req.Raw == nil {
+		return false
+	}
+	if value := req.Raw["content"]; value != nil {
+		if text, ok := value.(string); ok {
+			return strings.TrimSpace(text) != ""
+		}
+		return true
+	}
+	return false
+}
+
+func sendLarkMessage(ctx context.Context, client *lark.Client, target, receiveIDType, replyTo string, replyInThread *bool, msgType, content, messageUUID string) (*lark.SendMessageResponse, error) {
+	if strings.TrimSpace(replyTo) != "" {
+		return client.ReplyMessage(ctx, lark.ReplyMessageRequest{
+			MessageID:     replyTo,
+			MsgType:       msgType,
+			Content:       content,
+			UUID:          messageUUID,
+			ReplyInThread: replyInThread,
+		})
+	}
+	return client.SendMessage(ctx, lark.SendMessageRequest{
+		ReceiveID:     target,
+		ReceiveIDType: receiveIDType,
+		MsgType:       msgType,
+		Content:       content,
+		UUID:          messageUUID,
+	})
+}
+
+func larkMediaMessage(attachment sdk.MediaAttachment, resourceKey string) (string, string, string, error) {
+	resourceKey = strings.TrimSpace(resourceKey)
+	if resourceKey == "" {
+		return "", "", sdk.AttachmentStatusFailed, fmt.Errorf("lark media resource key is empty")
+	}
+	payload := map[string]any{}
+	status := sdk.AttachmentStatusSent
+	msgType := "file"
+	switch strings.TrimSpace(attachment.Kind) {
+	case sdk.MediaKindImage:
+		msgType = "image"
+		payload["image_key"] = resourceKey
+	case sdk.MediaKindAudio:
+		msgType = "audio"
+		payload["file_key"] = resourceKey
+		if attachment.DurationMillis > 0 {
+			payload["duration"] = attachment.DurationMillis
+		}
+	case sdk.MediaKindVideo:
+		msgType = "media"
+		payload["file_key"] = resourceKey
+	case sdk.MediaKindSticker:
+		status = sdk.AttachmentStatusDegraded
+		payload["file_key"] = resourceKey
+	default:
+		payload["file_key"] = resourceKey
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", "", sdk.AttachmentStatusFailed, err
+	}
+	return msgType, string(data), status, nil
 }
 
 func larkReplyTarget(ctx context.Context, client *lark.Client, threadID string) (string, *bool, error) {
@@ -554,11 +677,25 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 		return larkMentionMatchesBot(mention, bot)
 	})
 	chat := hook.Event.Message.ChatIdentity(senderID)
+	mediaClient := clientFromAccount(runtime, account)
+	seedLarkClientToken(mediaClient, state)
+	defer captureLarkClientToken(mediaClient, state)
+	attachments, cleanupAttachments, attachmentErrors := downloadLarkAttachments(ctx, mediaClient, hook.Event.Message)
+	if cleanupAttachments != nil {
+		defer cleanupAttachments()
+	}
+	if strings.TrimSpace(text) == "" && (len(attachments) > 0 || len(attachmentErrors) > 0) {
+		text = larkAttachmentPlaceholder(attachments, attachmentErrors)
+	}
 	inbound := buildInboundMessageForPlatform(platform, runtime.WorkspaceUUID, runtime.Channel.UUID, accountUUID, hook, text, bot)
+	inbound.Attachments = attachments
+	if len(attachmentErrors) > 0 {
+		inbound.Raw["attachment_errors"] = attachmentErrors
+	}
 	if chat.ChatType == "" || chat.ChatID == "" || chat.SenderID == "" {
 		return &WebhookResult{Type: hook.EventType(), Ignored: true, Reason: "incomplete_or_non_text_message"}, nil
 	}
-	if strings.TrimSpace(text) == "" && !inbound.MentionedMe {
+	if strings.TrimSpace(text) == "" && !inbound.MentionedMe && len(attachments) == 0 && len(attachmentErrors) == 0 {
 		return &WebhookResult{Type: hook.EventType(), Ignored: true, Reason: "incomplete_or_non_text_message"}, nil
 	}
 	threadID := larkThreadID(hook.Event.Message)
@@ -569,6 +706,10 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 	}
 	senderDisplayName := resolveLarkDisplayNames(ctx, runtime, account, state, &chat, hook.Event.Sender)
 	inbound = buildInboundMessageWithIdentityForPlatform(platform, runtime.WorkspaceUUID, runtime.Channel.UUID, accountUUID, hook, text, bot, chat, senderDisplayName)
+	inbound.Attachments = attachments
+	if len(attachmentErrors) > 0 {
+		inbound.Raw["attachment_errors"] = attachmentErrors
+	}
 	inbound.ReferencedMessage = resolveLarkReferencedMessage(ctx, runtime, account, state, platform, hook.Event.Message)
 
 	sessionUUID, err := runtime.Gateway.EnsureChatSession(ctx, sdk.EnsureChatSessionRequest{
@@ -603,6 +744,7 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 		SenderID:      sdk.IMPersonParticipantID(platform, chat.ChatType, chat.ChatID, chat.SenderID),
 		Content:       text,
 		DedupeKey:     key,
+		Attachments:   inbound.Attachments,
 		Metadata: map[string]any{
 			"source":              platform,
 			"platform":            platform,
@@ -636,6 +778,163 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 		return nil, err
 	}
 	return &WebhookResult{Type: hook.EventType(), SessionUUID: sessionUUID, MessageUUID: messageUUID, Inbound: &inbound}, nil
+}
+
+type larkMediaDescriptor struct {
+	Kind        string
+	ResourceID  string
+	FileName    string
+	ContentType string
+}
+
+func downloadLarkAttachments(ctx context.Context, client *lark.Client, message lark.EventMessage) ([]sdk.MediaAttachment, func(), []string) {
+	descriptors := larkMediaDescriptors(message)
+	if len(descriptors) == 0 {
+		return nil, nil, nil
+	}
+	attachments := make([]sdk.MediaAttachment, 0, len(descriptors))
+	cleanups := make([]func(), 0, len(descriptors))
+	var errors []string
+	cleanup := func() {
+		for index := len(cleanups) - 1; index >= 0; index-- {
+			if cleanups[index] != nil {
+				cleanups[index]()
+			}
+		}
+	}
+	for _, descriptor := range descriptors {
+		resourceType := "file"
+		if descriptor.Kind == sdk.MediaKindImage {
+			resourceType = "image"
+		}
+		path, remove, err := client.DownloadMessageResource(ctx, message.MessageID, descriptor.ResourceID, resourceType)
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("%s %s: %v", descriptor.Kind, descriptor.ResourceID, err))
+			continue
+		}
+		cleanups = append(cleanups, remove)
+		attachments = append(attachments, sdk.MediaAttachment{
+			ID:                 descriptor.ResourceID,
+			Kind:               descriptor.Kind,
+			Source:             sdk.MediaSourcePath,
+			Path:               path,
+			ContentType:        descriptor.ContentType,
+			FileName:           descriptor.FileName,
+			PlatformResourceID: descriptor.ResourceID,
+			Raw: map[string]any{
+				"message_id":    message.MessageID,
+				"resource_id":   descriptor.ResourceID,
+				"resource_type": resourceType,
+			},
+		})
+	}
+	return attachments, cleanup, errors
+}
+
+func larkMediaDescriptors(message lark.EventMessage) []larkMediaDescriptor {
+	messageType := strings.ToLower(strings.TrimSpace(message.MessageType))
+	seen := make(map[string]bool)
+	descriptors := make([]larkMediaDescriptor, 0, 4)
+	add := func(kind, resourceID, fileName, contentType string) {
+		resourceID = strings.TrimSpace(resourceID)
+		if resourceID == "" {
+			return
+		}
+		kind = strings.TrimSpace(kind)
+		if kind == "" {
+			kind = sdk.MediaKindFile
+		}
+		key := kind + ":" + resourceID
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		descriptors = append(descriptors, larkMediaDescriptor{Kind: kind, ResourceID: resourceID, FileName: strings.TrimSpace(fileName), ContentType: strings.TrimSpace(contentType)})
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(message.Content), &parsed); err == nil {
+		var walk func(any, string)
+		walk = func(value any, inheritedTag string) {
+			switch item := value.(type) {
+			case []any:
+				for _, child := range item {
+					walk(child, inheritedTag)
+				}
+			case map[string]any:
+				tag := strings.ToLower(strings.TrimSpace(stringValue(item["tag"])))
+				if tag == "" {
+					tag = inheritedTag
+				}
+				fileName := firstString(stringValue(item["file_name"]), stringValue(item["fileName"]), stringValue(item["name"]))
+				contentType := firstString(stringValue(item["content_type"]), stringValue(item["contentType"]), stringValue(item["mime_type"]))
+				switch tag {
+				case "img", "image":
+					add(sdk.MediaKindImage, firstString(stringValue(item["image_key"]), stringValue(item["key"])), fileName, contentType)
+				case "media", "video":
+					add(sdk.MediaKindVideo, firstString(stringValue(item["file_key"]), stringValue(item["media_key"]), stringValue(item["key"])), fileName, contentType)
+				}
+				for _, key := range []string{"content", "elements", "children", "body", "post", "zh_cn", "en_us"} {
+					if child, ok := item[key]; ok {
+						walk(child, tag)
+					}
+				}
+			}
+		}
+		walk(parsed, "")
+	}
+	switch messageType {
+	case "image":
+		add(sdk.MediaKindImage, larkJSONResourceID(parsed, "image_key", "key"), "", "image/*")
+	case "file":
+		add(sdk.MediaKindFile, larkJSONResourceID(parsed, "file_key", "key"), "", "")
+	case "audio":
+		add(sdk.MediaKindAudio, larkJSONResourceID(parsed, "file_key", "key"), "", "audio/*")
+	case "media", "video":
+		add(sdk.MediaKindVideo, larkJSONResourceID(parsed, "file_key", "media_key", "key"), "", "video/*")
+	case "sticker":
+		add(sdk.MediaKindSticker, larkJSONResourceID(parsed, "file_key", "image_key", "key"), "", "")
+	}
+	return descriptors
+}
+
+func larkJSONResourceID(value any, keys ...string) string {
+	item, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	for _, key := range keys {
+		if candidate := strings.TrimSpace(stringValue(item[key])); candidate != "" {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func larkAttachmentPlaceholder(attachments []sdk.MediaAttachment, errors []string) string {
+	labels := make([]string, 0, len(attachments)+len(errors))
+	for _, attachment := range attachments {
+		label := "附件"
+		switch attachment.Kind {
+		case sdk.MediaKindImage:
+			label = "图片"
+		case sdk.MediaKindFile:
+			label = "文件"
+		case sdk.MediaKindAudio:
+			label = "音频"
+		case sdk.MediaKindVideo:
+			label = "视频"
+		case sdk.MediaKindSticker:
+			label = "贴纸"
+		}
+		if attachment.FileName != "" && attachment.Kind == sdk.MediaKindFile {
+			label += ": " + attachment.FileName
+		}
+		labels = append(labels, "["+label+"]")
+	}
+	for range errors {
+		labels = append(labels, "[附件下载失败]")
+	}
+	return strings.Join(labels, " ")
 }
 
 func BuildInboundMessage(workspaceUUID, channelUUID, accountUUID string, hook *lark.Webhook, text string) sdk.InboundMessage {

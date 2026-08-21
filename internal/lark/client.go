@@ -6,13 +6,31 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
 
 const defaultRequestTimeout = 15 * time.Second
+
+const maxMediaBytes int64 = 32 << 20
+
+func blockedMediaHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" || host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
 
 type Client struct {
 	BaseURL              string
@@ -299,6 +317,247 @@ func (c *Client) ReplyMessage(ctx context.Context, req ReplyMessageRequest) (*Se
 		return nil, fmt.Errorf("reply message failed: code=%d msg=%s", resp.Code, resp.Msg)
 	}
 	return &resp, nil
+}
+
+// DownloadMessageResource downloads a message resource to a private temporary
+// file. Lark only exposes message resources through the message id and file
+// key, so the caller must preserve the message id from the event envelope.
+func (c *Client) DownloadMessageResource(ctx context.Context, messageID, resourceID, resourceType string) (string, func(), error) {
+	messageID = strings.TrimSpace(messageID)
+	resourceID = strings.TrimSpace(resourceID)
+	resourceType = strings.ToLower(strings.TrimSpace(resourceType))
+	if messageID == "" {
+		return "", nil, fmt.Errorf("message_id is required")
+	}
+	if resourceID == "" {
+		return "", nil, fmt.Errorf("resource_id is required")
+	}
+	if resourceType != "image" && resourceType != "file" {
+		resourceType = "file"
+	}
+	token, err := c.tokenForRequest(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	timeout := c.RequestTimeout
+	if timeout <= 0 {
+		timeout = defaultRequestTimeout
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(reqCtx, http.MethodGet, c.url("/im/v1/messages/"+url.PathEscape(messageID)+"/resources/"+url.PathEscape(resourceID), map[string]string{"type": resourceType}), nil)
+	if err != nil {
+		return "", nil, err
+	}
+	request.Header.Set("Accept", "application/octet-stream")
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("User-Agent", "BeakAgentLark/0.1.0")
+	client := c.HTTPClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(request)
+	if err != nil {
+		return "", nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		data, readErr := io.ReadAll(io.LimitReader(resp.Body, maxMediaBytes))
+		if readErr != nil {
+			return "", nil, readErr
+		}
+		return "", nil, &HTTPError{StatusCode: resp.StatusCode, Method: http.MethodGet, Path: request.URL.Path, Body: string(data)}
+	}
+	tmp, err := os.CreateTemp("", "beak-lark-resource-*")
+	if err != nil {
+		return "", nil, err
+	}
+	path := tmp.Name()
+	cleanup := func() { _ = os.Remove(path) }
+	if _, err := io.Copy(tmp, io.LimitReader(resp.Body, maxMediaBytes+1)); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return "", nil, err
+	}
+	if info, statErr := tmp.Stat(); statErr != nil {
+		_ = tmp.Close()
+		cleanup()
+		return "", nil, statErr
+	} else if info.Size() > maxMediaBytes {
+		_ = tmp.Close()
+		cleanup()
+		return "", nil, fmt.Errorf("lark media resource exceeds %d bytes", maxMediaBytes)
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return path, cleanup, nil
+}
+
+// DownloadURL materializes an HTTP(S) media URL to a private temporary file.
+// It is intentionally conservative because outbound attachments may originate
+// from an untrusted channel payload.
+func (c *Client) DownloadURL(ctx context.Context, rawURL string) (string, func(), error) {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", nil, fmt.Errorf("media URL must be absolute HTTP or HTTPS")
+	}
+	if blockedMediaHost(parsed.Hostname()) {
+		return "", nil, fmt.Errorf("media URL host is not allowed")
+	}
+	tokenURL := parsed.String()
+	timeout := c.RequestTimeout
+	if timeout <= 0 {
+		timeout = defaultRequestTimeout
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(reqCtx, http.MethodGet, tokenURL, nil)
+	if err != nil {
+		return "", nil, err
+	}
+	request.Header.Set("Accept", "application/octet-stream")
+	request.Header.Set("User-Agent", "BeakAgentLark/0.1.0")
+	client := c.HTTPClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(request)
+	if err != nil {
+		return "", nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", nil, &HTTPError{StatusCode: resp.StatusCode, Method: http.MethodGet, Path: parsed.Path, Body: resp.Status}
+	}
+	tmp, err := os.CreateTemp("", "beak-lark-outbound-*")
+	if err != nil {
+		return "", nil, err
+	}
+	path := tmp.Name()
+	cleanup := func() { _ = os.Remove(path) }
+	if _, err := io.Copy(tmp, io.LimitReader(resp.Body, maxMediaBytes+1)); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return "", nil, err
+	}
+	if info, statErr := tmp.Stat(); statErr != nil {
+		_ = tmp.Close()
+		cleanup()
+		return "", nil, statErr
+	} else if info.Size() > maxMediaBytes {
+		_ = tmp.Close()
+		cleanup()
+		return "", nil, fmt.Errorf("lark media resource exceeds %d bytes", maxMediaBytes)
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return path, cleanup, nil
+}
+
+// UploadMedia uploads a local file into the Lark media store and returns the
+// platform resource key used by image/file message types.
+func (c *Client) UploadMedia(ctx context.Context, path, kind, fileName string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("media path is required")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("media path is not a regular file")
+	}
+	if info.Size() > maxMediaBytes {
+		return "", fmt.Errorf("lark media resource exceeds %d bytes", maxMediaBytes)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	token, err := c.tokenForRequest(ctx)
+	if err != nil {
+		return "", err
+	}
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	field := "file"
+	endpoint := "/im/v1/files"
+	if strings.EqualFold(strings.TrimSpace(kind), "image") || strings.EqualFold(strings.TrimSpace(kind), "sticker") {
+		field = "image"
+		endpoint = "/im/v1/images"
+	}
+	uploadName := strings.TrimSpace(fileName)
+	if uploadName == "" {
+		uploadName = path
+	}
+	part, err := writer.CreateFormFile(field, filepath.Base(uploadName))
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.Copy(part, io.LimitReader(file, maxMediaBytes+1)); err != nil {
+		return "", err
+	}
+	if field == "image" {
+		if err := writer.WriteField("image_type", "message"); err != nil {
+			return "", err
+		}
+	} else if err := writer.WriteField("file_type", "stream"); err != nil {
+		return "", err
+	}
+	if err := writer.Close(); err != nil {
+		return "", err
+	}
+	timeout := c.RequestTimeout
+	if timeout <= 0 {
+		timeout = defaultRequestTimeout
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.url(endpoint, nil), &body)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	request.Header.Set("User-Agent", "BeakAgentLark/0.1.0")
+	client := c.HTTPClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(request)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxMediaBytes))
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", &HTTPError{StatusCode: resp.StatusCode, Method: http.MethodPost, Path: endpoint, Body: string(data)}
+	}
+	var result MediaUploadResponse
+	if err := json.Unmarshal(data, &result); err != nil {
+		return "", transientFailure(fmt.Sprintf("decode media upload response: %v", err))
+	}
+	if result.Code != 0 {
+		return "", fmt.Errorf("upload lark media failed: code=%d msg=%s", result.Code, result.Msg)
+	}
+	key := strings.TrimSpace(result.Data.ImageKey)
+	if key == "" {
+		key = strings.TrimSpace(result.Data.FileKey)
+	}
+	if key == "" {
+		return "", transientFailure("upload lark media failed: missing resource key")
+	}
+	return key, nil
 }
 
 func (c *Client) AddMessageReaction(ctx context.Context, req AddMessageReactionRequest) (*MessageReactionResponse, error) {

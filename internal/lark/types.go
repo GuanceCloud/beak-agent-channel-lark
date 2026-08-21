@@ -76,6 +76,15 @@ type SendMessageResponse struct {
 	} `json:"data"`
 }
 
+type MediaUploadResponse struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		ImageKey string `json:"image_key"`
+		FileKey  string `json:"file_key"`
+	} `json:"data"`
+}
+
 type MessageReactionResponse struct {
 	Code int    `json:"code"`
 	Msg  string `json:"msg"`

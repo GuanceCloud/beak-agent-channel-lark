@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -39,8 +40,11 @@ func TestLarkConnectorMetadataAndSchema(t *testing.T) {
 	if metadata.ID != ID || metadata.Platform != Platform || metadata.Label != "Lark/Feishu" {
 		t.Fatalf("metadata=%+v", metadata)
 	}
-	if !metadata.Capabilities.Text || !metadata.Capabilities.DirectChat || !metadata.Capabilities.GroupChat || metadata.Capabilities.Media {
+	if !metadata.Capabilities.Text || !metadata.Capabilities.DirectChat || !metadata.Capabilities.GroupChat || !metadata.Capabilities.Media {
 		t.Fatalf("capabilities=%+v", metadata.Capabilities)
+	}
+	if len(metadata.Capabilities.MediaKinds) != 5 {
+		t.Fatalf("media kinds=%v", metadata.Capabilities.MediaKinds)
 	}
 	if !metadata.Capabilities.Stream || metadata.Capabilities.Webhook {
 		t.Fatalf("stream/webhook capabilities=%+v", metadata.Capabilities)
@@ -503,6 +507,60 @@ func TestLarkConnectorWebhookCreatesMessageAndDedupes(t *testing.T) {
 	}
 	if gateway.messages[0].DedupeKey != "account-1:message:om_1" {
 		t.Fatalf("dedupe key=%q", gateway.messages[0].DedupeKey)
+	}
+}
+
+func TestLarkConnectorWebhookDownloadsImageAttachment(t *testing.T) {
+	connector := newTestWebhookConnector(t)
+	gateway := &fakeSDKGateway{}
+	store := newFakeSDKAccountStore()
+	account := sdkAccount("account-1", "cli_1", "secret_1", "https://open.feishu.test")
+	account.State["user_display_names"] = map[string]any{"ou_user": "Alice"}
+	account.State["chat_display_names"] = map[string]any{"oc_group": "Team"}
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "token-1", "expire": 7200})
+		case "/open-apis/im/v1/messages/om_image/resources/img_key":
+			if r.URL.Query().Get("type") != "image" {
+				t.Fatalf("resource type=%q", r.URL.Query().Get("type"))
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("image-bytes"))}, nil
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+			return nil, nil
+		}
+	})}
+	body := []byte(`{
+		"schema":"2.0",
+		"header":{"event_id":"evt_image","event_type":"im.message.receive_v1","app_id":"cli_1","token":"verify-token"},
+		"event":{
+			"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
+			"message":{"message_id":"om_image","chat_id":"oc_group","chat_type":"group","message_type":"image","content":"{\"image_key\":\"img_key\"}","create_time":"1770000000000"}
+		}
+	}`)
+	result, err := connector.HandleWebhook(context.Background(), sdk.Runtime{
+		WorkspaceUUID: "workspace-1",
+		Channel:       sdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: Platform},
+		Account:       account,
+		Gateway:       gateway,
+		AccountStore:  store,
+		HTTPClient:    httpClient,
+	}, account, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Inbound == nil || result.Inbound.Text != "[图片]" || len(result.Inbound.Attachments) != 1 {
+		t.Fatalf("inbound=%+v", result.Inbound)
+	}
+	attachment := result.Inbound.Attachments[0]
+	if attachment.Kind != sdk.MediaKindImage || attachment.Source != sdk.MediaSourcePath || attachment.PlatformResourceID != "img_key" || attachment.Path == "" {
+		t.Fatalf("attachment=%+v", attachment)
+	}
+	gateway.mu.Lock()
+	defer gateway.mu.Unlock()
+	if len(gateway.messages) != 1 || len(gateway.messages[0].Attachments) != 1 {
+		t.Fatalf("messages=%+v", gateway.messages)
 	}
 }
 
@@ -1358,6 +1416,65 @@ func TestLarkConnectorSendUsesRequestedAccount(t *testing.T) {
 		t.Fatal(err)
 	}
 	if result.AccountUUID != "account-2" || result.Platform != "feishu" || result.MessageID != "om_reply" {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestLarkConnectorSendImageAttachment(t *testing.T) {
+	mediaPath := t.TempDir() + "/image.png"
+	if err := os.WriteFile(mediaPath, []byte("image-bytes"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "token-1", "expire": 7200})
+		case "/open-apis/im/v1/images":
+			if err := r.ParseMultipartForm(1024 * 1024); err != nil {
+				t.Fatal(err)
+			}
+			if r.FormValue("image_type") != "message" {
+				t.Fatalf("image_type=%q", r.FormValue("image_type"))
+			}
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"image_key": "img_key"}})
+		case "/open-apis/im/v1/messages":
+			var body struct {
+				ReceiveID string `json:"receive_id"`
+				MsgType   string `json:"msg_type"`
+				Content   string `json:"content"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body.ReceiveID != "oc_group" || body.MsgType != "image" {
+				t.Fatalf("send body=%+v", body)
+			}
+			var content map[string]string
+			if err := json.Unmarshal([]byte(body.Content), &content); err != nil {
+				t.Fatal(err)
+			}
+			if content["image_key"] != "img_key" {
+				t.Fatalf("content=%+v", content)
+			}
+			return testJSONResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"message_id": "om_image", "chat_id": "oc_group"}})
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+			return nil, nil
+		}
+	})}
+	result, err := NewConnector().Send(context.Background(), sdk.Runtime{
+		HTTPClient: httpClient,
+		Account:    sdkAccount("account-1", "cli_1", "secret_1", "https://open.feishu.test"),
+	}, sdk.OutboundMessage{
+		AccountUUID: "account-1",
+		ChatType:    sdk.ChatTypeGroup,
+		ChatID:      "oc_group",
+		Attachments: []sdk.MediaAttachment{{ID: "att-1", Kind: sdk.MediaKindImage, Source: sdk.MediaSourcePath, Path: mediaPath, ContentType: "image/png"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.MessageID != "om_image" || len(result.AttachmentResults) != 1 || result.AttachmentResults[0].Status != sdk.AttachmentStatusSent || result.AttachmentResults[0].PlatformResourceID != "img_key" {
 		t.Fatalf("result=%+v", result)
 	}
 }

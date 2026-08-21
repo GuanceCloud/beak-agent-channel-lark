@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -99,6 +100,68 @@ func TestClientTenantTokenAndSendText(t *testing.T) {
 	}
 	if resp.Data.MessageID != "om_1" {
 		t.Fatalf("resp=%+v", resp)
+	}
+}
+
+func TestClientMediaDownloadAndUpload(t *testing.T) {
+	client := NewClient("https://open.feishu.test", "cli_1", "secret_1")
+	client.TenantToken = "cached-token"
+	client.HTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/open-apis/im/v1/messages/om_1/resources/img_key":
+			if r.URL.Query().Get("type") != "image" || r.Header.Get("Authorization") != "Bearer cached-token" {
+				t.Fatalf("download request=%s auth=%q", r.URL.String(), r.Header.Get("Authorization"))
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("image-bytes"))}, nil
+		case "/open-apis/im/v1/images":
+			if err := r.ParseMultipartForm(1024 * 1024); err != nil {
+				t.Fatal(err)
+			}
+			if r.FormValue("image_type") != "message" {
+				t.Fatalf("image_type=%q", r.FormValue("image_type"))
+			}
+			file, header, err := r.FormFile("image")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			if header.Filename != "photo.png" {
+				t.Fatalf("uploaded filename=%q", header.Filename)
+			}
+			data, err := io.ReadAll(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(data) != "upload-bytes" {
+				t.Fatalf("uploaded=%q", data)
+			}
+			return jsonResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"image_key": "img_uploaded"}})
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+			return nil, nil
+		}
+	})}
+
+	path, cleanup, err := client.DownloadMessageResource(context.Background(), "om_1", "img_key", "image")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "image-bytes" {
+		t.Fatalf("download path=%q data=%q err=%v", path, data, err)
+	}
+	cleanup()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("download temp file still exists: %q err=%v", path, err)
+	}
+
+	uploadPath := t.TempDir() + "/image.png"
+	if err := os.WriteFile(uploadPath, []byte("upload-bytes"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	key, err := client.UploadMedia(context.Background(), uploadPath, "image", "photo.png")
+	if err != nil || key != "img_uploaded" {
+		t.Fatalf("key=%q err=%v", key, err)
 	}
 }
 
