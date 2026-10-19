@@ -30,7 +30,7 @@ v1 支持：
 
 v1 不支持：
 
-- media、voice、typing status。
+- typing status；本次图片/文件完善不扩展音视频能力。
 - 一等 interactive card builder。
 - SDK 自己维护 WebSocket 事件客户端。
 - 修改 Beak host 代码。
@@ -289,3 +289,23 @@ Beak host 保存 account state，SDK 通过 `sdk.AccountStore` 读取并回写�
 go test ./...
 go build ./...
 ```
+
+## Agent 生成的图片与文件
+
+Host 通过 OutboundMessage.Attachments 提交当前会话的资源。图片使用原生 image 消息，普通附件使用 file 消息；支持文字与多个附件、纯附件及原消息/话题回复。普通文件按 stream 上传，同时发送独立 file_name 表单字段，文件名取展示名称的 basename。
+
+图片上传上限为 10 MiB，文件为 30 MiB，不接受空文件；飞书仍会独立校验格式、分辨率和权限。应用需开启机器人能力、消息发送和资源上传权限，参见[上传图片](https://open.feishu.cn/document/server-docs/im-v1/image/create)与[上传文件](https://open.feishu.cn/document/server-docs/im-v1/file/create)。
+
+每个附件独立返回 AttachmentResults。部分失败时保留已发送文字和附件，并向相同目标发送一条合并失败提示；提示不会包含本地路径或原始平台错误。所有附件失败且无成功正文时仍返回错误，提示成功不改变附件失败状态。提示自身失败保存在 SendResult.Raw.attachment_notice_error。
+
+当 Host 提供稳定 MessageUUID 和稳定附件顺序/身份时，SDK 为各附件生成不同且可重复的发送 uuid，利用飞书的一小时去重窗口。没有 MessageUUID 时不生成伪造的固定去重键；不承诺跨窗口永久去重，也不增加附件级持久化重试。
+
+回归命令（仓库根目录）：
+
+```sh
+GOWORK=off go -C beak-agent-lark test ./... -count=1
+GOWORK=off go -C beak-agent-lark vet ./...
+GOWORK=off go -C beak-channel-sdk-conformance-tests test ./... -count=1
+```
+
+测试使用真实 connector 和模拟 HTTP 平台，验证 multipart、原生消息、大小边界、部分/全部失败、通知失败与重试标识；这不代表真实飞书客户端验收已完成。

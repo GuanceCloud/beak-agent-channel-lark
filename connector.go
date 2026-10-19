@@ -316,67 +316,25 @@ func (c Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.Outbou
 		result.Raw["chat_id"] = firstString(resp.Data.ChatID, target)
 	}
 	var attachmentErrors []string
-	for _, attachment := range req.Attachments {
-		item := sdk.AttachmentSendResult{
-			AttachmentID: attachment.ID,
-			Kind:         attachment.Kind,
-			Status:       sdk.AttachmentStatusFailed,
-		}
-		if validateErr := sdk.ValidateMediaAttachment(attachment); validateErr != nil {
-			item.Error = validateErr.Error()
-			attachmentErrors = append(attachmentErrors, item.Error)
-			result.AttachmentResults = append(result.AttachmentResults, item)
-			continue
-		}
-		path := strings.TrimSpace(attachment.Path)
-		cleanup := func() {}
-		if path == "" && strings.TrimSpace(attachment.URL) != "" {
-			var downloadErr error
-			path, cleanup, downloadErr = client.DownloadURL(ctx, attachment.URL)
-			if downloadErr != nil {
-				item.Error = downloadErr.Error()
-				attachmentErrors = append(attachmentErrors, item.Error)
-				result.AttachmentResults = append(result.AttachmentResults, item)
-				continue
-			}
-		}
-		if path == "" {
-			item.Error = "lark outbound attachment path or URL is required"
-			attachmentErrors = append(attachmentErrors, item.Error)
-			result.AttachmentResults = append(result.AttachmentResults, item)
-			continue
-		}
-		key, uploadErr := client.UploadMedia(ctx, path, attachment.Kind, attachment.FileName)
-		cleanup()
-		if uploadErr != nil {
-			item.Error = uploadErr.Error()
-			attachmentErrors = append(attachmentErrors, item.Error)
-			result.AttachmentResults = append(result.AttachmentResults, item)
-			continue
-		}
-		msgType, mediaContent, status, contentErr := larkMediaMessage(attachment, key)
-		if contentErr != nil {
-			item.Error = contentErr.Error()
-			attachmentErrors = append(attachmentErrors, item.Error)
-			result.AttachmentResults = append(result.AttachmentResults, item)
-			continue
-		}
-		resp, sendErr := sendLarkMessage(ctx, client, target, receiveIDType(req), replyTo, replyInThread, msgType, mediaContent, "")
-		if sendErr != nil {
-			item.Error = sendErr.Error()
-			attachmentErrors = append(attachmentErrors, item.Error)
-			result.AttachmentResults = append(result.AttachmentResults, item)
-			continue
-		}
-		item.Status = status
-		item.MessageID = strings.TrimSpace(resp.Data.MessageID)
-		item.PlatformResourceID = key
-		result.MessageID = firstString(item.MessageID, result.MessageID)
-		result.Raw["chat_id"] = firstString(resp.Data.ChatID, target)
+	var failures []string
+	for index, attachment := range req.Attachments {
+		item, sendErr := sendLarkAttachment(ctx, client, req, attachment, index, replyTo, replyInThread)
 		result.AttachmentResults = append(result.AttachmentResults, item)
+		if sendErr != nil {
+			attachmentErrors = append(attachmentErrors, item.Error)
+			failures = append(failures, larkAttachmentFailure(attachment, index, sendErr))
+			continue
+		}
+		result.MessageID = firstString(item.MessageID, result.MessageID)
 	}
-	if len(attachmentErrors) > 0 {
+	if len(failures) > 0 {
 		result.Raw["attachment_errors"] = attachmentErrors
+		content, _ := json.Marshal(map[string]string{"text": larkAttachmentFailureNotice(failures)})
+		_, noticeErr := sendLarkMessage(ctx, client, target, receiveIDType(req), replyTo, replyInThread,
+			"text", string(content), larkMediaMessageUUID(req, "failure-notice"))
+		if noticeErr != nil {
+			result.Raw["attachment_notice_error"] = noticeErr.Error()
+		}
 	}
 	if strings.TrimSpace(result.MessageID) == "" {
 		if len(req.Attachments) == 0 {

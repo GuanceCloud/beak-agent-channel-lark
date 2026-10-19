@@ -20,6 +20,11 @@ const defaultRequestTimeout = 15 * time.Second
 
 const maxMediaBytes int64 = 32 << 20
 
+const (
+	maxImageUploadBytes int64 = 10 << 20
+	maxFileUploadBytes  int64 = 30 << 20
+)
+
 func blockedMediaHost(host string) bool {
 	host = strings.ToLower(strings.TrimSpace(host))
 	if host == "" || host == "localhost" || strings.HasSuffix(host, ".localhost") {
@@ -472,8 +477,16 @@ func (c *Client) UploadMedia(ctx context.Context, path, kind, fileName string) (
 	if !info.Mode().IsRegular() {
 		return "", fmt.Errorf("media path is not a regular file")
 	}
-	if info.Size() > maxMediaBytes {
-		return "", fmt.Errorf("lark media resource exceeds %d bytes", maxMediaBytes)
+	image := strings.EqualFold(strings.TrimSpace(kind), "image") || strings.EqualFold(strings.TrimSpace(kind), "sticker")
+	limit := maxFileUploadBytes
+	if image {
+		limit = maxImageUploadBytes
+	}
+	if info.Size() == 0 {
+		return "", ErrMediaEmpty
+	}
+	if info.Size() > limit {
+		return "", fmt.Errorf("%w: limit=%d bytes", ErrMediaTooLarge, limit)
 	}
 	file, err := os.Open(path)
 	if err != nil {
@@ -488,7 +501,7 @@ func (c *Client) UploadMedia(ctx context.Context, path, kind, fileName string) (
 	writer := multipart.NewWriter(&body)
 	field := "file"
 	endpoint := "/im/v1/files"
-	if strings.EqualFold(strings.TrimSpace(kind), "image") || strings.EqualFold(strings.TrimSpace(kind), "sticker") {
+	if image {
 		field = "image"
 		endpoint = "/im/v1/images"
 	}
@@ -496,19 +509,32 @@ func (c *Client) UploadMedia(ctx context.Context, path, kind, fileName string) (
 	if uploadName == "" {
 		uploadName = path
 	}
-	part, err := writer.CreateFormFile(field, filepath.Base(uploadName))
+	uploadName = filepath.Base(uploadName)
+	part, err := writer.CreateFormFile(field, uploadName)
 	if err != nil {
 		return "", err
 	}
-	if _, err := io.Copy(part, io.LimitReader(file, maxMediaBytes+1)); err != nil {
+	written, err := io.Copy(part, io.LimitReader(file, limit+1))
+	if err != nil {
 		return "", err
+	}
+	if written == 0 {
+		return "", ErrMediaEmpty
+	}
+	if written > limit {
+		return "", fmt.Errorf("%w: limit=%d bytes", ErrMediaTooLarge, limit)
 	}
 	if field == "image" {
 		if err := writer.WriteField("image_type", "message"); err != nil {
 			return "", err
 		}
-	} else if err := writer.WriteField("file_type", "stream"); err != nil {
-		return "", err
+	} else {
+		if err := writer.WriteField("file_type", "stream"); err != nil {
+			return "", err
+		}
+		if err := writer.WriteField("file_name", uploadName); err != nil {
+			return "", err
+		}
 	}
 	if err := writer.Close(); err != nil {
 		return "", err
@@ -548,7 +574,7 @@ func (c *Client) UploadMedia(ctx context.Context, path, kind, fileName string) (
 		return "", transientFailure(fmt.Sprintf("decode media upload response: %v", err))
 	}
 	if result.Code != 0 {
-		return "", fmt.Errorf("upload lark media failed: code=%d msg=%s", result.Code, result.Msg)
+		return "", responseError("upload lark media", result.Code, result.Msg)
 	}
 	key := strings.TrimSpace(result.Data.ImageKey)
 	if key == "" {

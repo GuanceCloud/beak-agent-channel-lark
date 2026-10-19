@@ -10,6 +10,8 @@ import (
 )
 
 var (
+	ErrMediaEmpty         = errors.New("lark media file is empty")
+	ErrMediaTooLarge      = errors.New("lark media file exceeds upload limit")
 	ErrCredentialRejected = errors.New("lark credential rejected")
 	ErrTransientFailure   = errors.New("lark transient platform failure")
 )
