@@ -29,13 +29,15 @@ type Connector struct {
 }
 
 type WebhookResult struct {
-	Type        string              `json:"type"`
-	Challenge   string              `json:"challenge,omitempty"`
-	Ignored     bool                `json:"ignored,omitempty"`
-	Reason      string              `json:"reason,omitempty"`
-	SessionUUID string              `json:"session_uuid,omitempty"`
-	MessageUUID string              `json:"message_uuid,omitempty"`
-	Inbound     *sdk.InboundMessage `json:"inbound,omitempty"`
+	InteractionToastType    string              `json:"-"`
+	InteractionToastContent string              `json:"-"`
+	Type                    string              `json:"type"`
+	Challenge               string              `json:"challenge,omitempty"`
+	Ignored                 bool                `json:"ignored,omitempty"`
+	Reason                  string              `json:"reason,omitempty"`
+	SessionUUID             string              `json:"session_uuid,omitempty"`
+	MessageUUID             string              `json:"message_uuid,omitempty"`
+	Inbound                 *sdk.InboundMessage `json:"inbound,omitempty"`
 }
 
 type EventResult = WebhookResult
@@ -68,6 +70,7 @@ func (c Connector) Metadata() sdk.ConnectorMetadata {
 		Label:       meta.Label,
 		Description: meta.Description,
 		Capabilities: sdk.Capabilities{
+			Interactions:     sdk.InteractionCapabilities{ToolApproval: true, PlanConfirmation: true, Update: "always"},
 			LoginModes:       []string{sdk.LoginModeCredential},
 			Text:             caps.Text,
 			Media:            caps.Media,
@@ -248,6 +251,9 @@ func (c Connector) Start(ctx context.Context, runtime sdk.Runtime) error {
 }
 
 func (c Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.OutboundMessage) (*sdk.SendResult, error) {
+	if req.Interaction != nil {
+		return sendLarkInteraction(ctx, runtime, req)
+	}
 	account, err := selectRuntimeAccount(runtime, req.AccountUUID)
 	if err != nil {
 		return nil, err
@@ -509,6 +515,14 @@ func (c Connector) HandleWebhook(ctx context.Context, runtime sdk.Runtime, accou
 	if err != nil {
 		return nil, err
 	}
+	if handled, response, err := handleLarkInteraction(ctx, runtime, account, decoded, true); handled || err != nil {
+		result := &WebhookResult{Type: "card.action.trigger"}
+		if response != nil && response.Toast != nil {
+			result.InteractionToastType, result.InteractionToastContent = response.Toast.Type, response.Toast.Content
+		}
+		return result, err
+	}
+
 	hook, err := lark.ParseEvent(decoded)
 	if err != nil {
 		return nil, err
@@ -526,6 +540,10 @@ func (c Connector) HandleWebhook(ctx context.Context, runtime sdk.Runtime, accou
 }
 
 func (c Connector) HandleEvent(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, body []byte) (*EventResult, error) {
+	if handled, _, err := handleLarkInteraction(ctx, runtime, account, body, false); handled || err != nil {
+		return &WebhookResult{Type: "card.action.trigger"}, err
+	}
+
 	hook, err := lark.ParseEvent(body)
 	if err != nil {
 		return nil, err
@@ -584,6 +602,12 @@ func verifyLarkWebhookRequestSignature(timestamp, nonce, encryptKey string, body
 }
 
 func larkWebhookResponse(result *WebhookResult) (*sdk.WebhookResponse, error) {
+	if result != nil && result.Type == "card.action.trigger" {
+		if result.InteractionToastType != "" {
+			return jsonWebhookResponse(map[string]any{"toast": map[string]string{"type": result.InteractionToastType, "content": result.InteractionToastContent}})
+		}
+		return jsonWebhookResponse(map[string]any{"toast": map[string]string{"type": "success", "content": "已处理"}})
+	}
 	if result != nil && strings.TrimSpace(result.Type) == "url_verification" && strings.TrimSpace(result.Challenge) != "" {
 		return jsonWebhookResponse(map[string]string{"challenge": result.Challenge})
 	}
@@ -1899,19 +1923,19 @@ func accountStateToSDK(account state.AccountState, existing sdk.ChannelAccount) 
 		existing.Credential = map[string]any{}
 	}
 	existing.State = map[string]any{
-		"channel_link_session":                         account.ChannelLinkSession,
-		"peer_sessions":                                account.PeerSessions,
-		"user_display_names":                           account.UserDisplayNames,
-		"chat_display_names":                           account.ChatDisplayNames,
-		"inbound_seen":                                 account.InboundSeen,
-		"sent_beak_messages":                           account.SentBeakMessages,
-		"stream_cursors":                               account.StreamCursors,
-		"tenant_access_token":                          account.TenantAccessToken,
-		"tenant_access_token_expires_at":               account.TokenExpiresAt,
-		"bot_open_id":                                  account.BotOpenID,
-		"bot_name":                                     account.BotName,
-		"bot_user_id":                                  account.BotUserID,
-		"bot_union_id":                                 account.BotUnionID,
+		"channel_link_session":           account.ChannelLinkSession,
+		"peer_sessions":                  account.PeerSessions,
+		"user_display_names":             account.UserDisplayNames,
+		"chat_display_names":             account.ChatDisplayNames,
+		"inbound_seen":                   account.InboundSeen,
+		"sent_beak_messages":             account.SentBeakMessages,
+		"stream_cursors":                 account.StreamCursors,
+		"tenant_access_token":            account.TenantAccessToken,
+		"tenant_access_token_expires_at": account.TokenExpiresAt,
+		"bot_open_id":                    account.BotOpenID,
+		"bot_name":                       account.BotName,
+		"bot_user_id":                    account.BotUserID,
+		"bot_union_id":                   account.BotUnionID,
 		sdk.RuntimeHealthKeyStreamConnectionState:      account.StreamConnectionState,
 		sdk.RuntimeHealthKeyStreamConnectedAt:          account.StreamConnectedAt,
 		sdk.RuntimeHealthKeyStreamDisconnectedAt:       account.StreamDisconnectedAt,

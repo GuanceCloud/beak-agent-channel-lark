@@ -869,3 +869,56 @@ func encryptForTest(t *testing.T, plain string, key string) string {
 	cipher.NewCBCEncrypter(block, iv).CryptBlocks(out[len(iv):], padded)
 	return base64.StdEncoding.EncodeToString(out)
 }
+
+// The platform boundary must preserve retry identity while respecting the API
+// limit; live E2E cannot reliably exercise every length and shared-prefix case.
+func TestMessageUUIDPlatformContract(t *testing.T) {
+	for _, operation := range []string{"send", "reply"} {
+		t.Run(operation, func(t *testing.T) {
+			client := NewClient("https://open.feishu.test", "cli_1", "secret_1")
+			client.TenantToken = "cached-token"
+			var sent string
+			client.HTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				sent, _ = body["uuid"].(string)
+				if len(sent) > 50 {
+					t.Errorf("%s UUID exceeds platform limit: length=%d", operation, len(sent))
+				}
+				return jsonResponse(map[string]any{"code": 0, "data": map[string]string{"message_id": "om_test"}})
+			})}
+			seen := map[string]string{}
+			for _, input := range []string{"", "msg-uuid", strings.Repeat("a", 50), strings.Repeat("a", 51), strings.Repeat("a", 50) + "b", "im_approval_12345678-1234-1234-1234-123456789abc_1_pending"} {
+				first := ""
+				for retry := 0; retry < 2; retry++ {
+					var err error
+					if operation == "send" {
+						_, err = client.SendMessage(context.Background(), SendMessageRequest{ReceiveID: "oc_chat", Content: `{"text":"test"}`, UUID: input})
+					} else {
+						_, err = client.ReplyMessage(context.Background(), ReplyMessageRequest{MessageID: "om_parent", Content: `{"text":"test"}`, UUID: input})
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(input) <= 50 && sent != input {
+						t.Errorf("compatible UUID changed: input=%q sent=%q", input, sent)
+					}
+					if input != "" && sent == "" {
+						t.Fatal("non-empty retry identity was dropped")
+					}
+					if retry == 0 {
+						first = sent
+					} else if sent != first {
+						t.Errorf("retry UUID changed: first=%q retry=%q", first, sent)
+					}
+				}
+				if previous, exists := seen[sent]; exists && previous != input {
+					t.Errorf("distinct message UUIDs collide: %q and %q", previous, input)
+				}
+				seen[sent] = input
+			}
+		})
+	}
+}

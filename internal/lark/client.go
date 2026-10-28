@@ -3,6 +3,8 @@ package lark
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -252,6 +254,16 @@ func (c *Client) SendText(ctx context.Context, req SendTextRequest) (*SendTextRe
 	})
 }
 
+// Feishu/Lark limits the message deduplication UUID to 50 bytes. Hash only
+// oversized host IDs so retries stay stable and existing short IDs stay valid.
+func platformMessageUUID(id string) string {
+	if len(id) <= 50 {
+		return id
+	}
+	digest := sha256.Sum256([]byte(id))
+	return "beak_" + base64.RawURLEncoding.EncodeToString(digest[:])
+}
+
 func (c *Client) SendMessage(ctx context.Context, req SendMessageRequest) (*SendMessageResponse, error) {
 	if strings.TrimSpace(req.ReceiveID) == "" {
 		return nil, fmt.Errorf("receive_id is required")
@@ -277,7 +289,7 @@ func (c *Client) SendMessage(ctx context.Context, req SendMessageRequest) (*Send
 		"content":    req.Content,
 	}
 	if req.UUID != "" {
-		body["uuid"] = req.UUID
+		body["uuid"] = platformMessageUUID(req.UUID)
 	}
 	var resp SendMessageResponse
 	if err := c.doJSON(ctx, http.MethodPost, "/im/v1/messages", map[string]string{"receive_id_type": receiveIDType}, body, &resp, withBearer(token)); err != nil {
@@ -309,7 +321,7 @@ func (c *Client) ReplyMessage(ctx context.Context, req ReplyMessageRequest) (*Se
 		"content":  req.Content,
 	}
 	if req.UUID != "" {
-		body["uuid"] = req.UUID
+		body["uuid"] = platformMessageUUID(req.UUID)
 	}
 	if req.ReplyInThread != nil {
 		body["reply_in_thread"] = *req.ReplyInThread

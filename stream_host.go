@@ -14,6 +14,7 @@ import (
 
 	"github.com/GuanceCloud/beak-agent-channel-lark/sdk"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
+	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 )
@@ -139,6 +140,9 @@ func (c Connector) handleLarkDataFrame(ctx context.Context, runtime sdk.Runtime,
 	startedAt := time.Now()
 	var handled *EventResult
 	eventHandler := dispatcher.NewEventDispatcher("", "").
+		OnP2CardActionTrigger(func(frameCtx context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
+			return processLarkInteraction(frameCtx, runtime, account, event)
+		}).
 		OnP2MessageReceiveV1(func(frameCtx context.Context, event *larkim.P2MessageReceiveV1) error {
 			body, err := larkStreamEventBody(event)
 			if err != nil {
