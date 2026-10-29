@@ -26,7 +26,7 @@ func TestPlanCardFeedbackLifecycle(t *testing.T) {
 		return testJSONResponse(map[string]any{"code": 0, "data": map[string]string{"message_id": "om_plan"}})
 	})}}
 	var card sdk.InteractionCard
-	if err := json.Unmarshal([]byte(`{"request_id":"plan_123","revision":1,"kind":"plan_confirmation","state":"pending","title":"演示计划","summary":"## 目标\n仅输出 **完成**。 <at id=all>不应提醒全员</at>","plan_confirmation":{"feedback_enabled":true},"actions":[{"id":"approve","label":"批准计划"},{"id":"reject","label":"拒绝计划"},{"id":"revise","label":"要求修改"}]}`), &card); err != nil {
+	if err := json.Unmarshal([]byte(`{"language":"zh","request_id":"plan_123","revision":1,"kind":"plan_confirmation","state":"pending","title":"演示计划","summary":"## 目标\n仅输出 **完成**。 <at id=all>不应提醒全员</at>","plan_confirmation":{"feedback_enabled":true},"actions":[{"id":"approve","label":"批准计划"},{"id":"reject","label":"拒绝计划"},{"id":"revise","label":"要求修改"}]}`), &card); err != nil {
 		t.Fatal(err)
 	}
 	_, err := NewConnector().Send(context.Background(), runtime, sdk.OutboundMessage{AccountUUID: account.UUID, ChatID: "oc_chat", MessageUUID: "plan_demo", Interaction: &card})

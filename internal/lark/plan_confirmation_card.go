@@ -2,6 +2,7 @@ package lark
 
 import (
 	"encoding/json"
+	"github.com/GuanceCloud/beak-agent-channel-lark/internal/locale"
 	"html"
 	"strings"
 
@@ -9,6 +10,7 @@ import (
 )
 
 func renderPlanConfirmation(card sdk.InteractionCard) ([]byte, error) {
+	tr := locale.Translator(card.Language)
 	label, color, notice := planPresentation(card)
 	elements := []any{
 		approvalMarkdown("**" + escapeCardMarkdown(card.Title) + "**"),
@@ -27,11 +29,11 @@ func renderPlanConfirmation(card sdk.InteractionCard) ([]byte, error) {
 		text := action.Label
 		switch action.ID {
 		case "approve":
-			text, style = "批准计划", "primary_filled"
+			text, style = tr("Approve plan"), "primary_filled"
 		case "reject":
-			text = "拒绝计划"
+			text = tr("Reject plan")
 		case "revise":
-			text = "要求修改"
+			text = tr("Request changes")
 		}
 		button := map[string]any{
 			"tag": "button", "text": map[string]string{"tag": "plain_text", "content": text},
@@ -40,8 +42,8 @@ func renderPlanConfirmation(card sdk.InteractionCard) ([]byte, error) {
 		if action.ID == "revise" && card.PlanConfirmation != nil && card.PlanConfirmation.FeedbackEnabled {
 			button["name"], button["form_action_type"] = "plan_revise", "submit"
 			revisionForm = map[string]any{"tag": "form", "name": "plan_revision", "elements": []any{
-				approvalMarkdown("**要求修改**\n填写调整说明后提交，Agent 将重新生成计划，等待你再次确认。"),
-				map[string]any{"tag": "input", "name": "reason", "required": true, "input_type": "multiline_text", "max_length": 1000, "width": "fill", "placeholder": map[string]string{"tag": "plain_text", "content": "输入调整说明"}},
+				approvalMarkdown(tr("**Request changes**\nDescribe the changes and submit. The Agent will revise the plan for your confirmation.")),
+				map[string]any{"tag": "input", "name": "reason", "required": true, "input_type": "multiline_text", "max_length": 1000, "width": "fill", "placeholder": map[string]string{"tag": "plain_text", "content": tr("Describe the changes")}},
 				button,
 			}}
 		} else {
@@ -55,33 +57,34 @@ func renderPlanConfirmation(card sdk.InteractionCard) ([]byte, error) {
 		elements = append(elements, map[string]any{"tag": "hr"}, revisionForm)
 	}
 	if detail := card.PlanConfirmation; detail != nil && detail.Feedback != "" {
-		elements = append(elements, approvalMarkdown("**调整说明**\n"+planMarkdown(detail.Feedback)))
+		elements = append(elements, approvalMarkdown(tr("**Requested changes**\n")+planMarkdown(detail.Feedback)))
 	}
 	return json.Marshal(map[string]any{
 		"schema": "2.0", "config": map[string]any{"update_multi": true},
-		"header": map[string]any{"title": map[string]string{"tag": "plain_text", "content": "计划确认 · " + label}, "subtitle": map[string]string{"tag": "plain_text", "content": "Beak · 核对计划后决定下一步"}, "template": color},
+		"header": map[string]any{"title": map[string]string{"tag": "plain_text", "content": tr("Plan confirmation · ") + label}, "subtitle": map[string]string{"tag": "plain_text", "content": tr("Beak · Review the plan before continuing")}, "template": color},
 		"body":   map[string]any{"direction": "vertical", "padding": "12px 12px 12px 12px", "elements": elements},
 	})
 }
 
 func planPresentation(card sdk.InteractionCard) (string, string, string) {
+	tr := locale.Translator(card.Language)
 	if d := card.PlanConfirmation; d != nil && d.DecisionAction == "revise" && card.State == "rejected" {
 		if d.AwaitingRevisionInput {
-			return "待补充修改意见", "orange", "请在当前聊天中发送调整说明，收到后将重新生成计划。"
+			return tr("Awaiting change details"), "orange", tr("Send the requested changes in this chat. The Agent will then revise the plan.")
 		}
-		return "已要求修改", "orange", "调整说明已提交。旧计划不会执行，请等待并确认新的计划。"
+		return tr("Changes requested"), "orange", tr("Changes submitted. The old plan will not execute. Wait for the revised plan and confirm it.")
 	}
 	switch card.State {
 	case "approved":
-		return "已批准", "green", "计划已获批准，执行结果将另行回复。"
+		return tr("Approved"), "green", tr("Plan approved. Execution results will follow separately.")
 	case "rejected":
-		return "已拒绝", "red", "计划已拒绝，不会执行。"
+		return tr("Rejected"), "red", tr("Plan rejected. It will not execute.")
 	case "canceled":
-		return "已取消", "grey", "此计划已失效，请查看最新计划。"
+		return tr("Canceled"), "grey", tr("This plan is no longer active. Review the latest plan.")
 	case "expired":
-		return "已过期", "grey", "此计划已过期，请重新发起。"
+		return tr("Expired"), "grey", tr("This plan has expired. Send a new request.")
 	default:
-		return "待确认", "blue", "请核对计划内容。批准后开始执行；需要调整时请填写下方说明并提交。"
+		return tr("Awaiting confirmation"), "blue", tr("Review the plan. Approval starts execution; submit the requested changes below if needed.")
 	}
 }
 

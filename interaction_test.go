@@ -27,6 +27,7 @@ func (g *requesterDeniedGateway) HandleInteraction(context.Context, sdk.Interact
 
 func TestOtherMemberGetsPrivateWarningWithoutCardUpdate(t *testing.T) {
 	account := sdkAccount("acct-1", "cli_1", "secret_1", "")
+	account.Platform = "feishu"
 	runtime := sdk.Runtime{Account: account, Gateway: &requesterDeniedGateway{fakeSDKGateway: &fakeSDKGateway{}}}
 	var event callback.CardActionTriggerEvent
 	body := `{"schema":"2.0","header":{"event_id":"event-card","event_type":"card.action.trigger","app_id":"cli_1"},"event":{"operator":{"open_id":"ou_other"},"context":{"open_chat_id":"oc_chat","open_message_id":"om_card"},"action":{"value":{"beak_action":"approval_123:3:approve"}}}}`
@@ -57,6 +58,7 @@ func TestLarkAndFeishuInteraction(t *testing.T) {
 	for _, brand := range []string{"feishu", "lark"} {
 		t.Run(brand, func(t *testing.T) {
 			account := sdkAccount("acct-1", "cli_1", "secret_1", "")
+			account.Platform = "feishu"
 			account.Credential["brand"] = brand
 			account.Platform = brand
 			gateway := &interactionTestGateway{fakeSDKGateway: &fakeSDKGateway{}}
@@ -70,13 +72,20 @@ func TestLarkAndFeishuInteraction(t *testing.T) {
 				}
 				return testJSONResponse(map[string]any{"code": 0, "data": map[string]string{"message_id": "om_card"}})
 			})}}
-			card := &sdk.InteractionCard{RequestID: "approval_123", Revision: 3, Kind: "tool_approval", State: "pending", Title: "Approval", Summary: "Run operation", Actions: []sdk.InteractionButton{{ID: "approve", Label: "Approve"}}}
+			card := &sdk.InteractionCard{RequestID: "approval_123", Revision: 3, Kind: "tool_approval", State: "pending", Title: "Approval", Summary: "Run operation", ToolApproval: &sdk.ToolApprovalDetails{ToolName: "exec"}, Actions: []sdk.InteractionButton{{ID: "approve", Label: "Approve"}}}
 			result, err := NewConnector().Send(context.Background(), runtime, sdk.OutboundMessage{AccountUUID: account.UUID, ChatID: "oc_chat", MessageUUID: "im_approval_12345678-1234-1234-1234-123456789abc_1_pending", Interaction: card})
 			if err != nil || result.MessageID != "om_card" {
 				t.Fatalf("send: %#v %v", result, err)
 			}
 			if id, _ := payload["uuid"].(string); id == "" || len(id) > 50 {
 				t.Fatalf("invalid platform UUID: %q", id)
+			}
+			wantTitle := "Tool approval"
+			if brand == "feishu" {
+				wantTitle = "操作审批"
+			}
+			if !strings.Contains(payload["content"].(string), wantTitle) {
+				t.Fatalf("%s default language: %v", brand, payload["content"])
 			}
 			if payload["msg_type"] != "interactive" {
 				t.Fatalf("not native card: %#v", payload)
@@ -98,6 +107,7 @@ func TestToolApprovalCardLifecycle(t *testing.T) {
 	for _, tool := range []string{"bash", "write_file", "mcp__database__execute", "<at id=all>```unsafe"} {
 		t.Run(tool, func(t *testing.T) {
 			account := sdkAccount("acct-1", "cli_1", "secret_1", "")
+			account.Platform = "feishu"
 			var payload map[string]any
 			var method, path string
 			runtime := sdk.Runtime{Account: account, Gateway: &fakeSDKGateway{}, AccountStore: newFakeSDKAccountStore(), HTTPClient: &http.Client{Transport: testRoundTripFunc(func(req *http.Request) (*http.Response, error) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/GuanceCloud/beak-agent-channel-lark/internal/locale"
 	"strings"
 	"unicode/utf8"
 
@@ -18,7 +19,9 @@ func sendLarkInteraction(ctx context.Context, runtime sdk.Runtime, req sdk.Outbo
 		return nil, err
 	}
 	client := clientFromAccount(runtime, account)
-	id, err := client.SendInteraction(ctx, req.ChatID, req.MessageUUID, *req.Interaction)
+	card := *req.Interaction
+	card.Language = sdk.ResolveInteractionLanguage(effectiveAccountPlatform(runtime, account), card.Language)
+	id, err := client.SendInteraction(ctx, req.ChatID, req.MessageUUID, card)
 	if err != nil {
 		return nil, err
 	}
@@ -57,7 +60,7 @@ func processLarkInteraction(ctx context.Context, runtime sdk.Runtime, account sd
 		reason, ok := data.Action.FormValue["reason"].(string)
 		reason = strings.TrimSpace(reason)
 		if action.ActionID != "revise" || len(data.Action.FormValue) != 1 || !ok || reason == "" || utf8.RuneCountInString(reason) > 1000 {
-			return nil, fmt.Errorf("请填写调整说明（1–1000 字）")
+			return nil, fmt.Errorf("revision details must contain 1-1000 characters")
 		}
 		action.Inputs = map[string]string{"reason": reason}
 	}
@@ -65,14 +68,21 @@ func processLarkInteraction(ctx context.Context, runtime sdk.Runtime, account sd
 	action.ChatID = data.Context.OpenChatID
 	action.MessageID = data.Context.OpenMessageID
 	action.EventID = event.EventV2Base.Header.EventID
-	if _, err := sdk.DispatchInteraction(ctx, runtime, action); err != nil {
+	result, err := sdk.DispatchInteraction(ctx, runtime, action)
+	if err != nil {
+		tr := locale.Translator(sdk.InteractionErrorLanguage(effectiveAccountPlatform(runtime, account), err))
 		var access interface{ InteractionErrorCode() string }
 		if errors.As(err, &access) && access.InteractionErrorCode() == "actor_not_requester" {
 			return &callback.CardActionTriggerResponse{Toast: &callback.Toast{
-				Type: "warning", Content: "只有本次任务的发起人可以审批，请联系发起人处理。",
+				Type: "warning", Content: tr("Only the requester can decide this approval. Please contact the requester."),
 			}}, nil
 		}
 		return nil, err
 	}
-	return &callback.CardActionTriggerResponse{Toast: &callback.Toast{Type: "success", Content: "已处理"}}, nil
+	language := ""
+	if result != nil && result.Card != nil {
+		language = result.Card.Language
+	}
+	tr := locale.Translator(sdk.ResolveInteractionLanguage(effectiveAccountPlatform(runtime, account), language))
+	return &callback.CardActionTriggerResponse{Toast: &callback.Toast{Type: "success", Content: tr("Processed")}}, nil
 }
